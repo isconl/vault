@@ -1,0 +1,11 @@
+# Confirmed false positives, checked by hand -- not real secrets. gitleaks
+# scans full git history (fetch-depth: 0 in secrets-scan.yml), so a finding
+# in an OLD commit keeps re-triggering even after the current file is fixed
+# or annotated with `gitleaks:allow` (that only suppresses future commits
+# containing the same line). One fingerprint per line, format:
+# <commit>:<file>:<rule>:<line> -- reproduce with `gitleaks detect --source . -v`.
+
+# lib/graph.js:3 doc-comment prose ("Microsoft Graph (OneDrive/M365) client:
+# token lifecycle...") false-positives generic-api-key's entropy heuristic.
+# No secret-shaped content anywhere near it -- verified by hand.
+12b45b40a05bdfa1f3e28afb239df1593a67029e:lib/graph.js:generic-api-key:3
