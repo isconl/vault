@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "node src/server.js",
-    "test": "node --test test/"
+    "test": "node --test"
   },
   "dependencies": {
     "@bitwarden/sdk-napi": "^1.0.0"
