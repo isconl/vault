@@ -71,8 +71,8 @@ async function main() {
 
   // -- 5. Microsoft Graph client --------------------------------------------
   let graphConfig = {
-    clientId: process.env.MSGRAPH_CLIENT_ID || '',
-    clientSecret: process.env.MSGRAPH_CLIENT_SECRET || '',
+    clientId: process.env.MSGRAPH_CLIENT_ID || secretStore.get('MSGRAPH_CLIENT_ID') || '',
+    clientSecret: process.env.MSGRAPH_CLIENT_SECRET || secretStore.get('MSGRAPH_CLIENT_SECRET') || '',
     accessToken: process.env.MSGRAPH_ACCESS_TOKEN || '',
     refreshToken: secretStore.get('MSGRAPH_REFRESH_TOKEN') || '',
   };
