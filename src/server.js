@@ -171,6 +171,19 @@ async function main() {
         const ok = store.append(collection, row);
         return sendJson(res, ok ? 200 : 400, { ok, collection });
       }
+      // Full-collection replace, for callers that need to filter/mutate rows
+      // (delete, bulk edit) rather than only append. The client reads current
+      // rows via GET, computes the new set locally, and PUTs it back -- the
+      // same read-modify-write contract store.rewrite()'s callback expresses
+      // locally, translated to something an HTTP body can carry (a function
+      // can't cross the wire; a full row array can).
+      if (req.method === 'PUT') {
+        let rows = [];
+        try { rows = JSON.parse(await readBody(req) || '{}').rows; } catch {}
+        if (!Array.isArray(rows)) return sendJson(res, 400, { ok: false, error: 'body must be {"rows": [...]}' });
+        const removed = store.rewrite(collection, () => rows);
+        return sendJson(res, 200, { ok: true, collection, count: rows.length, removed });
+      }
     }
 
     if (pathname === '/vault/bootstrap' && req.method === 'POST') {
