@@ -1,0 +1,9 @@
+node_modules
+npm-debug.log
+runtime
+memory
+.git
+.github
+test
+*.test.js
+.env
