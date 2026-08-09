@@ -97,6 +97,47 @@ test('a valid static token can write and then read back a vault row -- the full 
   } finally { server.close(); cleanup(); }
 });
 
+test('PUT /vault/:collection replaces the whole row set -- the read-modify-write path other engines use for delete/bulk-edit', async () => {
+  const { server, port, cleanup } = await startServer();
+  try {
+    for (const t of [{ ID: 'T1', TITLE: 'Keep me' }, { ID: 'T2', TITLE: 'Delete me' }]) {
+      await fetch(`http://127.0.0.1:${port}/vault/scope%2Ftasks.tsv`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer test-static-token', 'Content-Type': 'application/json' },
+        body: JSON.stringify(t),
+      });
+    }
+    const put = await fetch(`http://127.0.0.1:${port}/vault/scope%2Ftasks.tsv`, {
+      method: 'PUT',
+      headers: { Authorization: 'Bearer test-static-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rows: [{ ID: 'T1', TITLE: 'Keep me' }] }),
+    });
+    assert.equal(put.status, 200);
+    const putBody = await put.json();
+    assert.equal(putBody.ok, true);
+    assert.equal(putBody.count, 1);
+
+    const read = await fetch(`http://127.0.0.1:${port}/vault/scope%2Ftasks.tsv`, {
+      headers: { Authorization: 'Bearer test-static-token' },
+    });
+    const readBody = await read.json();
+    assert.equal(readBody.rows.length, 1);
+    assert.equal(readBody.rows[0].ID, 'T1');
+  } finally { server.close(); cleanup(); }
+});
+
+test('PUT /vault/:collection rejects a non-array rows body', async () => {
+  const { server, port, cleanup } = await startServer();
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/vault/scope%2Ftasks.tsv`, {
+      method: 'PUT',
+      headers: { Authorization: 'Bearer test-static-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ notRows: true }),
+    });
+    assert.equal(res.status, 400);
+  } finally { server.close(); cleanup(); }
+});
+
 test('wrong token is rejected, and repeated failures eventually lock out the IP', async () => {
   const { server, port, cleanup } = await startServer();
   try {
