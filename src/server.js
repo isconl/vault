@@ -63,7 +63,9 @@ async function main() {
   const auth = createAuthModule({
     getAuthToken: () => process.env.VAULT_TOKEN || process.env.ISCONL_TOKEN || '',
     getTotpSecret: () => secretStore.get('TOTP_SECRET') || secretStore.get('ISCONL_TOTP_SECRET') || '',
-    getPinDigest: () => process.env.VAULT_PIN_HASH || '',
+    // Same key the legacy monolith reads (ISCONL_PIN_HASH) -- one Bitwarden
+    // secret covers both surfaces rather than a vault-only duplicate.
+    getPinDigest: () => secretStore.get('PIN_HASH') || secretStore.get('ISCONL_PIN_HASH') || process.env.VAULT_PIN_HASH || '',
     sessionFile: SESSION_FILE,
     trustProxy: /^(1|true|yes)$/i.test(process.env.VAULT_TRUST_PROXY || ''),
     auditLog,
