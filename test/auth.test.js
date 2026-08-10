@@ -55,6 +55,19 @@ test('verifyPin: correct digest passes, wrong fails, unconfigured fails closed',
   assert.equal(noPin.verifyPin('4242').ok, false);
 });
 
+test('methods() reports exactly what is configured, not a static capability list', () => {
+  const both = createAuthModule({
+    getTotpSecret: () => TOTP_SECRET, getPinDigest: () => pinDigest('4242'), sessionFile: tmpSessionFile(),
+  });
+  assert.deepEqual(both.methods(), { totp: true, pin: true });
+
+  const totpOnly = createAuthModule({ getTotpSecret: () => TOTP_SECRET, sessionFile: tmpSessionFile() });
+  assert.deepEqual(totpOnly.methods(), { totp: true, pin: false });
+
+  const neither = createAuthModule({ sessionFile: tmpSessionFile() });
+  assert.deepEqual(neither.methods(), { totp: false, pin: false });
+});
+
 test('authenticate() fails closed when nothing is configured, even for a well-formed request', () => {
   const auth = createAuthModule({ sessionFile: tmpSessionFile() });
   const req = { headers: {}, socket: { remoteAddress: '1.2.3.4' }, url: '/api/state' };
