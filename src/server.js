@@ -107,6 +107,9 @@ async function main() {
     }
 
     // -- auth routes: public (they ARE the login), each with its own lockout --
+    if (pathname === '/auth/methods' && req.method === 'GET') {
+      return sendJson(res, 200, auth.methods());
+    }
     if (pathname === '/auth/totp' && req.method === 'POST') {
       const ip = auth.clientIp(req);
       const lockout = auth.checkLoginLockout(ip);
