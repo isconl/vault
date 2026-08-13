@@ -21,6 +21,8 @@ const { createAuditLog } = require('../lib/audit');
 const { createAuthModule } = require('../lib/auth');
 const { createVaultStore } = require('../lib/store');
 const { createGraphClient } = require('../lib/graph');
+const blocksModule = require('../lib/blocks');
+const onedriveSync = require('../lib/onedrive-sync');
 const manifest = require('../lib/manifest');
 
 const PORT = parseInt(process.env.VAULT_PORT || process.env.PORT || '8081', 10);
@@ -54,6 +56,16 @@ async function main() {
   // -- 3. Vault store: bootstrap + self-repair BEFORE serving any request ----
   const store = createVaultStore({ memoryDir: MEMORY_DIR, logsDir: LOGS_DIR, auditLog });
   const repairResult = store.bootRepair();
+
+  // Day-scheduling engine (ported from isconl-agent's lib/blocks.js, dev
+  // branch): injected against vault's own store/audit rather than the
+  // monolith's globals, same pattern as every other lib/ module here.
+  blocksModule.init({
+    readTSV: store.read,
+    appendTSV: store.append,
+    rewriteTSV: store.rewrite,
+    auditLog: (event, data) => auditLog.log(event, data),
+  });
   console.log(`  vault: ${repairResult.created.length} file(s) bootstrapped, ` +
     `${repairResult.columnsUpgraded} column migration(s), ` +
     `${repairResult.emptyFilesRepaired} empty-file repair(s), ` +
@@ -194,6 +206,43 @@ async function main() {
     if (pathname === '/vault/bootstrap' && req.method === 'POST') {
       const result = store.bootRepair();
       return sendJson(res, 200, result);
+    }
+
+    // Server epoch millis -- what a client's trusted-clock sync (offset +
+    // round-trip correction) measures against. No auth-sensitive content,
+    // but kept behind the same auth gate as everything else here for
+    // consistency (a client already has a session by the time it needs this).
+    if (pathname === '/time' && req.method === 'GET') {
+      return sendJson(res, 200, { now: Date.now() });
+    }
+
+    if (pathname === '/blocks' && req.method === 'GET') {
+      const tasks = store.read('scope/tasks.tsv');
+      const people = store.read('circle/people.tsv');
+      return sendJson(res, 200, blocksModule.plan({ tasks, people }));
+    }
+    if (pathname === '/blocks' && req.method === 'POST') {
+      let patch = {};
+      try { patch = JSON.parse(await readBody(req) || '{}'); } catch {}
+      try {
+        const row = blocksModule.save(patch);
+        return sendJson(res, 200, { ok: true, block: row });
+      } catch (e) {
+        return sendJson(res, 400, { ok: false, error: String(e.message || e) });
+      }
+    }
+
+    // Read-only OneDrive verification: compares the real remote copy of one
+    // collection against the local vault, changes nothing on either side.
+    // Deliberately GET-only tonight -- see lib/onedrive-sync.js's header for
+    // why the write path isn't here yet.
+    if (pathname === '/onedrive/check' && req.method === 'GET') {
+      const { searchParams } = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+      const collection = searchParams.get('collection');
+      if (!collection) return sendJson(res, 400, { error: 'collection query param required, e.g. scope/tasks.tsv' });
+      const localRows = store.read(collection);
+      const result = await onedriveSync.checkRemote(graph, collection, localRows);
+      return sendJson(res, result.ok ? 200 : 502, result);
     }
 
     if (pathname === '/graph/request' && req.method === 'POST') {
