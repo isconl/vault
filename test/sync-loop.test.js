@@ -4,11 +4,12 @@ const assert = require('node:assert/strict');
 const { createSyncLoop, allCollections } = require('../lib/sync-loop');
 const defaultSchema = require('../lib/default-schema');
 
-function fakeOnedriveSync({ failCollections = [] } = {}) {
+function fakeOnedriveSync({ failCollections = [], failFolders = [] } = {}) {
   const tsvCalls = [];
   const rawCalls = [];
+  const folderCalls = [];
   return {
-    tsvCalls, rawCalls,
+    tsvCalls, rawCalls, folderCalls,
     pullToLocal: async (graph, store, relPath) => {
       tsvCalls.push(relPath);
       if (failCollections.includes(relPath)) return { collection: relPath, ok: false, status: 404, error: 'not found' };
@@ -19,7 +20,16 @@ function fakeOnedriveSync({ failCollections = [] } = {}) {
       if (failCollections.includes(relPath)) return { collection: relPath, ok: false, status: 404, error: 'not found' };
       return { collection: relPath, ok: true, remoteBytes: 10, localBytesBefore: 0, localBytesAfter: 10 };
     },
+    pullFolder: async (graph, store, folder) => {
+      folderCalls.push(folder);
+      if (failFolders.includes(folder)) return { folder, ok: false, status: 404, error: 'not found' };
+      return { folder, ok: true, files: [{ file: '00-intro.md', ok: true }] };
+    },
   };
+}
+
+function fakeStoreWithCourses(courseIds) {
+  return { read: (rel) => (rel === 'learning/courses.tsv' ? courseIds.map((ID) => ({ ID })) : []) };
 }
 
 function fakeAuditLog() {
@@ -112,4 +122,35 @@ test('getLastResult reflects the most recent completed pass', async () => {
   await loop.runOnce();
   assert.ok(loop.getLastResult());
   assert.equal(loop.getLastResult().failed.length, 0);
+});
+
+test('runOnce pulls every course\'s lesson folder, using course IDs from the just-pulled learning/courses.tsv', async () => {
+  const onedriveSync = fakeOnedriveSync();
+  const store = fakeStoreWithCourses(['viva', 'wabba-ux']);
+  const loop = createSyncLoop({ onedriveSync, graph: {}, store, delayMs: 0 });
+  const result = await loop.runOnce();
+
+  assert.deepEqual(onedriveSync.folderCalls, ['learning/viva', 'learning/wabba-ux']);
+  assert.ok(result.ok.some((r) => r.collection === 'learning/viva'));
+  assert.ok(result.ok.some((r) => r.collection === 'learning/wabba-ux'));
+});
+
+test('a course whose folder pull fails does not block the rest of the pass or the other courses', async () => {
+  const onedriveSync = fakeOnedriveSync({ failFolders: ['learning/wabba-ux'] });
+  const store = fakeStoreWithCourses(['viva', 'wabba-ux', 'wellspring']);
+  const loop = createSyncLoop({ onedriveSync, graph: {}, store, delayMs: 0 });
+  const result = await loop.runOnce();
+
+  assert.equal(onedriveSync.folderCalls.length, 3, 'every course was still attempted');
+  assert.ok(result.failed.some((f) => f.collection === 'learning/wabba-ux'));
+  assert.ok(result.ok.some((r) => r.collection === 'learning/viva'));
+  assert.ok(result.ok.some((r) => r.collection === 'learning/wellspring'));
+});
+
+test('no courses in learning/courses.tsv (or store.read throwing) means zero folder pulls, not a crash', async () => {
+  const onedriveSync = fakeOnedriveSync();
+  const loop = createSyncLoop({ onedriveSync, graph: {}, store: {}, delayMs: 0 }); // store.read is undefined -> throws, caught
+  const result = await loop.runOnce();
+  assert.equal(onedriveSync.folderCalls.length, 0);
+  assert.equal(result.failed.length, 0);
 });

@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { checkRemote, fetchRemoteText, pullToLocal, REMOTE_ROOT } = require('../lib/onedrive-sync');
+const { checkRemote, fetchRemoteText, pullToLocal, listRemoteFolder, pullFolder, REMOTE_ROOT } = require('../lib/onedrive-sync');
 const { createVaultStore } = require('../lib/store');
 
 function fakeGraph(response) {
@@ -12,6 +12,22 @@ function fakeGraph(response) {
   return {
     calls,
     graphRequest: async (pathAndQuery) => { calls.push(pathAndQuery); return response; },
+  };
+}
+
+/** A graph fake that routes by whether the request is a :/children listing or a :/content fetch, since folder pulls make both kinds of call in one pass. */
+function fakeGraphRouter({ children, contentByFile }) {
+  const calls = [];
+  return {
+    calls,
+    graphRequest: async (pathAndQuery) => {
+      calls.push(pathAndQuery);
+      if (pathAndQuery.endsWith(':/children')) return children;
+      for (const [name, response] of Object.entries(contentByFile)) {
+        if (pathAndQuery.includes(encodeURIComponent(name))) return response;
+      }
+      return { status: 404, data: { error: { code: 'itemNotFound' } } };
+    },
   };
 }
 
@@ -105,4 +121,74 @@ test('pullToLocal respects the massacre guard on an already-populated file, with
   const result = await pullToLocal(graph, store, 'scope/tasks.tsv');
   assert.equal(result.ok, true);   // the fetch succeeded; the guard is what stood down the write
   assert.equal(store.read('scope/tasks.tsv').length, 3, 'guard refused the bulk drop -- local rows untouched');
+});
+
+test('listRemoteFolder lists file children only, skipping subfolders', async () => {
+  const graph = fakeGraphRouter({
+    children: { status: 200, data: { value: [
+      { name: '00-intro.md', file: {} },
+      { name: '01-deep-dive.md', file: {} },
+      { name: '_notes', folder: {} },
+    ] } },
+    contentByFile: {},
+  });
+  const result = await listRemoteFolder(graph, 'learning/viva');
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.files, ['00-intro.md', '01-deep-dive.md']);
+});
+
+test('listRemoteFolder reports failure cleanly on a non-200, never throws', async () => {
+  const graph = fakeGraphRouter({ children: { status: 404, data: { error: { code: 'itemNotFound' } } }, contentByFile: {} });
+  const result = await listRemoteFolder(graph, 'learning/missing-course');
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 404);
+});
+
+test('pullFolder pulls every file the listing reports into the local vault', async () => {
+  const store = tmpStore();
+  const graph = fakeGraphRouter({
+    children: { status: 200, data: { value: [
+      { name: '00-intro.md', file: {} },
+      { name: '01-deep-dive.md', file: {} },
+    ] } },
+    contentByFile: {
+      '00-intro.md': { status: 200, data: '# Intro' },
+      '01-deep-dive.md': { status: 200, data: '# Deep dive' },
+    },
+  });
+  const result = await pullFolder(graph, store, 'learning/viva');
+  assert.equal(result.ok, true);
+  assert.equal(result.files.length, 2);
+  assert.ok(result.files.every((f) => f.ok));
+  assert.equal(store.rawRead('learning/viva/00-intro.md'), '# Intro');
+  assert.equal(store.rawRead('learning/viva/01-deep-dive.md'), '# Deep dive');
+});
+
+test('pullFolder reports the listing failure directly when the folder itself 404s', async () => {
+  const store = tmpStore();
+  const graph = fakeGraphRouter({ children: { status: 404, data: { error: { code: 'itemNotFound' } } }, contentByFile: {} });
+  const result = await pullFolder(graph, store, 'learning/missing-course');
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 404);
+});
+
+test('pullFolder records a per-file failure without losing the files that did succeed', async () => {
+  const store = tmpStore();
+  const graph = fakeGraphRouter({
+    children: { status: 200, data: { value: [
+      { name: '00-intro.md', file: {} },
+      { name: '01-broken.md', file: {} },
+    ] } },
+    contentByFile: {
+      '00-intro.md': { status: 200, data: '# Intro' },
+      // 01-broken.md deliberately has no content entry -> the router's default 404
+    },
+  });
+  const result = await pullFolder(graph, store, 'learning/viva');
+  assert.equal(result.ok, true);   // the folder listing itself succeeded
+  const broken = result.files.find((f) => f.file === '01-broken.md');
+  const intro = result.files.find((f) => f.file === '00-intro.md');
+  assert.equal(broken.ok, false);
+  assert.equal(intro.ok, true);
+  assert.equal(store.rawRead('learning/viva/00-intro.md'), '# Intro');
 });
