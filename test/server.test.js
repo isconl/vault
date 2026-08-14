@@ -35,6 +35,11 @@ async function startServer(envOverrides = {}) {
     VAULT_SESSION_FILE: sessionFile,
     VAULT_TOKEN: 'test-static-token',
     BWS_ACCESS_TOKEN: '',   // no Bitwarden in tests -- secrets.init() must degrade gracefully, not hang/throw
+    // Explicit, not just absent: the sync loop now also falls back to a
+    // Bitwarden secret (VAULT_SYNC_INTERVAL_MS) for portability, so on a
+    // machine that DOES have real Bitwarden creds in its ambient env this
+    // would otherwise fire real Graph calls during every test run.
+    VAULT_SYNC_INTERVAL_MS: '0',
     ...envOverrides,
   });
   delete require.cache[require.resolve('../src/server')];
