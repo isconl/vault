@@ -212,6 +212,30 @@ async function main() {
       return sendJson(res, 200, result);
     }
 
+    // Same shape as /vault/:collection above, for the non-TSV state files
+    // (calendar_events.json, rhythm.json, the identity YAMLs) that another
+    // engine on a different host needs to read/write through vault rather
+    // than keeping its own on-disk copy -- the same host-sharing gap
+    // /vault/:collection's own header already fixed for TSV rows, still
+    // open for these until now.
+    if (pathname.startsWith('/vault-raw/')) {
+      const collection = decodeURIComponent(pathname.slice('/vault-raw/'.length));
+      if (req.method === 'GET') {
+        return sendJson(res, 200, { collection, text: store.rawRead(collection) });
+      }
+      if (req.method === 'PUT') {
+        let body = {};
+        try { body = JSON.parse(await readBody(req) || '{}'); } catch {}
+        if (typeof body.text !== 'string') return sendJson(res, 400, { ok: false, error: 'body must be {"text": "..."}' });
+        try {
+          store.rawWrite(collection, body.text, { force: !!body.force });
+        } catch (e) {
+          return sendJson(res, 409, { ok: false, error: String(e.message || e) });
+        }
+        return sendJson(res, 200, { ok: true, collection, bytes: body.text.length });
+      }
+    }
+
     // Server epoch millis -- what a client's trusted-clock sync (offset +
     // round-trip correction) measures against. No auth-sensitive content,
     // but kept behind the same auth gate as everything else here for
