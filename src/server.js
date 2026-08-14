@@ -73,7 +73,7 @@ async function main() {
 
   // -- 4. Auth ------------------------------------------------------------------
   const auth = createAuthModule({
-    getAuthToken: () => process.env.VAULT_TOKEN || process.env.ISCONL_TOKEN || '',
+    getAuthToken: () => process.env.VAULT_TOKEN || process.env.ISCONL_TOKEN || secretStore.get('VAULT_TOKEN') || '',
     getTotpSecret: () => secretStore.get('TOTP_SECRET') || secretStore.get('ISCONL_TOTP_SECRET') || '',
     // Same key the legacy monolith reads (ISCONL_PIN_HASH) -- one Bitwarden
     // secret covers both surfaces rather than a vault-only duplicate.
@@ -89,6 +89,10 @@ async function main() {
     clientSecret: process.env.MSGRAPH_CLIENT_SECRET || secretStore.get('MSGRAPH_CLIENT_SECRET') || '',
     accessToken: process.env.MSGRAPH_ACCESS_TOKEN || '',
     refreshToken: secretStore.get('MSGRAPH_REFRESH_TOKEN') || '',
+    // This app registration is locked to a specific Azure AD tenant --
+    // /common/ and /consumers/ both fail (confirmed live, 2026-08-14).
+    // Falls back to 'common' (graph.js's own default) if unset.
+    tenantId: process.env.MSGRAPH_TENANT_ID || secretStore.get('MSGRAPH_TENANT_ID') || '',
   };
   const graph = createGraphClient({
     getConfig: () => graphConfig,
@@ -100,7 +104,7 @@ async function main() {
   });
 
   // -- 6. FAIL CLOSED bind guard (same rule as the monolith this was extracted from) --
-  const authConfigured = !!(process.env.VAULT_TOKEN || process.env.ISCONL_TOKEN
+  const authConfigured = !!(process.env.VAULT_TOKEN || process.env.ISCONL_TOKEN || secretStore.get('VAULT_TOKEN')
     || secretStore.get('TOTP_SECRET') || secretStore.get('ISCONL_TOTP_SECRET') || process.env.VAULT_PIN_HASH);
   const isLoopback = ['127.0.0.1', '::1', 'localhost'].includes(BIND);
   if (!isLoopback && !authConfigured) {
@@ -230,6 +234,37 @@ async function main() {
       } catch (e) {
         return sendJson(res, 400, { ok: false, error: String(e.message || e) });
       }
+    }
+
+    // Microsoft 365 device-code sign-in: start mints a code + verification
+    // URL, poll checks whether the user has completed it yet (Microsoft's
+    // own polling contract -- keeps returning "still waiting" until the
+    // user visits the URL and enters the code, or the code expires).
+    if (pathname === '/msgraph/auth/start' && req.method === 'POST') {
+      const data = await graph.startDeviceCodeAuth();
+      if (!data?.device_code) return sendJson(res, 502, { ok: false, error: data?.error_description || 'could not start device code sign-in' });
+      return sendJson(res, 200, {
+        ok: true,
+        userCode: data.user_code,
+        verificationUri: data.verification_uri || data.verification_uri_complete,
+        expiresInSec: data.expires_in,
+        deviceCode: data.device_code,   // needed by /msgraph/auth/poll -- not a secret, expires in minutes
+        pollIntervalSec: data.interval || 5,
+      });
+    }
+    if (pathname === '/msgraph/auth/poll' && req.method === 'POST') {
+      let deviceCode = '';
+      try { deviceCode = JSON.parse(await readBody(req) || '{}').deviceCode || ''; } catch {}
+      if (!deviceCode) return sendJson(res, 400, { ok: false, error: 'deviceCode required' });
+      const r = await graph.pollDeviceCodeAuth(deviceCode);
+      if (r.success) return sendJson(res, 200, { ok: true, connected: true });
+      // authorization_pending / slow_down are the "keep polling" states, not
+      // real failures -- everything else (expired_token, access_denied) is.
+      const err = r.data?.error || '';
+      if (err === 'authorization_pending' || err === 'slow_down') {
+        return sendJson(res, 200, { ok: true, connected: false, waiting: true });
+      }
+      return sendJson(res, 200, { ok: true, connected: false, waiting: false, error: r.data?.error_description || err });
     }
 
     // Read-only OneDrive verification: compares the real remote copy of one
