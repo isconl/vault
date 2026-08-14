@@ -23,6 +23,7 @@ const { createVaultStore } = require('../lib/store');
 const { createGraphClient } = require('../lib/graph');
 const blocksModule = require('../lib/blocks');
 const onedriveSync = require('../lib/onedrive-sync');
+const { createSyncLoop } = require('../lib/sync-loop');
 const manifest = require('../lib/manifest');
 
 const PORT = parseInt(process.env.VAULT_PORT || process.env.PORT || '8081', 10);
@@ -30,6 +31,12 @@ const BIND = process.env.VAULT_BIND || '127.0.0.1';
 const MEMORY_DIR = process.env.VAULT_MEMORY_DIR || path.join(__dirname, '..', 'memory');
 const LOGS_DIR = process.env.VAULT_LOGS_DIR || path.join(__dirname, '..', 'runtime', 'logs');
 const SESSION_FILE = process.env.VAULT_SESSION_FILE || path.join(__dirname, '..', 'runtime', 'sessions.json');
+// Off by default -- the test suite calls main() repeatedly with no real
+// Graph credentials configured, and an enabled-by-default loop would fire
+// ~35 real HTTPS calls per test. Explicit opt-in (dev-local.sh sets this
+// for real runs; Render should set it too) matches the fail-closed pattern
+// the rest of this file already uses for auth.
+const SYNC_INTERVAL_MS = parseInt(process.env.VAULT_SYNC_INTERVAL_MS || '0', 10);
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -102,6 +109,15 @@ async function main() {
     },
     auditLog,
   });
+
+  // -- 5.5. OneDrive sync loop (boot-time pull + interval repeat) -------------
+  const syncLoop = createSyncLoop({ onedriveSync, graph, store, auditLog });
+  if (SYNC_INTERVAL_MS > 0) {
+    syncLoop.start(SYNC_INTERVAL_MS);
+    console.log(`  onedrive sync: enabled, every ${Math.round(SYNC_INTERVAL_MS / 1000)}s`);
+  } else {
+    console.log('  onedrive sync: disabled (set VAULT_SYNC_INTERVAL_MS to enable)');
+  }
 
   // -- 6. FAIL CLOSED bind guard (same rule as the monolith this was extracted from) --
   const authConfigured = !!(process.env.VAULT_TOKEN || process.env.ISCONL_TOKEN || secretStore.get('VAULT_TOKEN')
@@ -210,6 +226,17 @@ async function main() {
     if (pathname === '/vault/bootstrap' && req.method === 'POST') {
       const result = store.bootRepair();
       return sendJson(res, 200, result);
+    }
+
+    // On-demand full sync pass (every known collection), independent of the
+    // interval timer -- for verifying the loop works, or forcing a refresh
+    // without waiting for VAULT_SYNC_INTERVAL_MS to elapse.
+    if (pathname === '/onedrive/sync-all' && req.method === 'POST') {
+      const result = await syncLoop.runOnce();
+      return sendJson(res, 200, result);
+    }
+    if (pathname === '/onedrive/sync-status' && req.method === 'GET') {
+      return sendJson(res, 200, { running: syncLoop.isRunning(), lastResult: syncLoop.getLastResult() });
     }
 
     // Same shape as /vault/:collection above, for the non-TSV state files
@@ -338,7 +365,7 @@ async function main() {
     server.listen(PORT, BIND, () => {
       const actualPort = server.address().port;
       console.log(`  vault listening on ${BIND}:${actualPort}`);
-      resolve({ server, store, auth, graph, auditLog, secretStore, port: actualPort });
+      resolve({ server, store, auth, graph, auditLog, secretStore, syncLoop, port: actualPort });
     });
   });
 }
