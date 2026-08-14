@@ -280,6 +280,20 @@ async function main() {
       return sendJson(res, result.ok ? 200 : 502, result);
     }
 
+    // Pulls one collection's real OneDrive content into the local vault,
+    // replacing whatever's there. Local-disk write only -- never writes
+    // back to OneDrive itself (see lib/onedrive-sync.js's header).
+    if (pathname === '/onedrive/pull' && req.method === 'POST') {
+      const { searchParams } = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+      const collection = searchParams.get('collection');
+      if (!collection) return sendJson(res, 400, { error: 'collection query param required, e.g. scope/tasks.tsv' });
+      let body = {};
+      try { body = JSON.parse(await readBody(req) || '{}'); } catch {}
+      const result = await onedriveSync.pullToLocal(graph, store, collection, { force: !!body.force });
+      if (result.ok) auditLog.log('onedrive_pulled', { collection, rows: result.remoteRowCount });
+      return sendJson(res, result.ok ? 200 : 502, result);
+    }
+
     if (pathname === '/graph/request' && req.method === 'POST') {
       let body;
       try { body = JSON.parse(await readBody(req) || '{}'); } catch { body = {}; }

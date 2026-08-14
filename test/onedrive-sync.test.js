@@ -1,7 +1,11 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { checkRemote, fetchRemoteText, REMOTE_ROOT } = require('../lib/onedrive-sync');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { checkRemote, fetchRemoteText, pullToLocal, REMOTE_ROOT } = require('../lib/onedrive-sync');
+const { createVaultStore } = require('../lib/store');
 
 function fakeGraph(response) {
   const calls = [];
@@ -9,6 +13,12 @@ function fakeGraph(response) {
     calls,
     graphRequest: async (pathAndQuery) => { calls.push(pathAndQuery); return response; },
   };
+}
+
+function tmpStore() {
+  const memoryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vault-onedrive-test-'));
+  const logsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vault-onedrive-logs-'));
+  return createVaultStore({ memoryDir, logsDir, schema: { 'scope/tasks.tsv': 'ID\tTITLE\tSTATUS' } });
 }
 
 test('REMOTE_ROOT is the verified-correct path, not the legacy monolith\'s stale one', () => {
@@ -54,4 +64,45 @@ test('checkRemote surfaces auth/network failure as ok:false rather than throwing
   const result = await checkRemote(graph, 'scope/tasks.tsv', []);
   assert.equal(result.ok, false);
   assert.equal(result.status, 401);
+});
+
+test('pullToLocal writes real remote content into an empty local file', async () => {
+  const store = tmpStore();
+  store.ensureVault();   // bootstraps scope/tasks.tsv with just its header, same as a fresh vault
+  assert.equal(store.read('scope/tasks.tsv').length, 0);
+
+  const graph = fakeGraph({ status: 200, data: 'ID\tTITLE\tSTATUS\n1\tBuy milk\topen\n2\tCall Taylor\topen\n' });
+  const result = await pullToLocal(graph, store, 'scope/tasks.tsv');
+
+  assert.equal(result.ok, true);
+  assert.equal(result.localRowCountBefore, 0);
+  assert.equal(result.localRowCountAfter, 2);
+  const after = store.read('scope/tasks.tsv');
+  assert.equal(after.length, 2);
+  assert.equal(after[0].TITLE, 'Buy milk');
+});
+
+test('pullToLocal never touches the local file on a fetch failure', async () => {
+  const store = tmpStore();
+  store.ensureVault();
+  const graph = fakeGraph({ status: 401, data: { error: 'no' } });
+  const result = await pullToLocal(graph, store, 'scope/tasks.tsv');
+  assert.equal(result.ok, false);
+  assert.equal(store.read('scope/tasks.tsv').length, 0);
+});
+
+test('pullToLocal respects the massacre guard on an already-populated file, without force', async () => {
+  const store = tmpStore();
+  store.ensureVault();
+  store.append('scope/tasks.tsv', { ID: '1', TITLE: 'Existing', STATUS: 'open' });
+  store.append('scope/tasks.tsv', { ID: '2', TITLE: 'Existing 2', STATUS: 'open' });
+  store.append('scope/tasks.tsv', { ID: '3', TITLE: 'Existing 3', STATUS: 'open' });
+  assert.equal(store.read('scope/tasks.tsv').length, 3);
+
+  // Remote has only 1 row -- pulling it in would drop 2 of 3 local rows,
+  // which the guard refuses without force.
+  const graph = fakeGraph({ status: 200, data: 'ID\tTITLE\tSTATUS\n9\tRemote only\topen\n' });
+  const result = await pullToLocal(graph, store, 'scope/tasks.tsv');
+  assert.equal(result.ok, true);   // the fetch succeeded; the guard is what stood down the write
+  assert.equal(store.read('scope/tasks.tsv').length, 3, 'guard refused the bulk drop -- local rows untouched');
 });
