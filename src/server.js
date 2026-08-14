@@ -31,12 +31,6 @@ const BIND = process.env.VAULT_BIND || '127.0.0.1';
 const MEMORY_DIR = process.env.VAULT_MEMORY_DIR || path.join(__dirname, '..', 'memory');
 const LOGS_DIR = process.env.VAULT_LOGS_DIR || path.join(__dirname, '..', 'runtime', 'logs');
 const SESSION_FILE = process.env.VAULT_SESSION_FILE || path.join(__dirname, '..', 'runtime', 'sessions.json');
-// Off by default -- the test suite calls main() repeatedly with no real
-// Graph credentials configured, and an enabled-by-default loop would fire
-// ~35 real HTTPS calls per test. Explicit opt-in (dev-local.sh sets this
-// for real runs; Render should set it too) matches the fail-closed pattern
-// the rest of this file already uses for auth.
-const SYNC_INTERVAL_MS = parseInt(process.env.VAULT_SYNC_INTERVAL_MS || '0', 10);
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -111,6 +105,16 @@ async function main() {
   });
 
   // -- 5.5. OneDrive sync loop (boot-time pull + interval repeat) -------------
+  // Off by default -- the test suite calls main() repeatedly with no real
+  // Graph credentials configured, and an enabled-by-default loop would fire
+  // ~35 real HTTPS calls per test. Explicit opt-in matches the fail-closed
+  // pattern the rest of this file already uses for auth. Falls back to a
+  // Bitwarden secret (not just the env var) so this survives a fresh clone
+  // on ANY machine/deploy path -- dev-local.sh and docker-compose.yml both
+  // set the env var already, but Render's per-service env isn't in this
+  // repo at all, and Bitwarden is the one config source every deployment
+  // path already depends on (see _handoff/migration-log.md, 2026-08-14).
+  const SYNC_INTERVAL_MS = parseInt(process.env.VAULT_SYNC_INTERVAL_MS || secretStore.get('VAULT_SYNC_INTERVAL_MS') || '0', 10);
   const syncLoop = createSyncLoop({ onedriveSync, graph, store, auditLog });
   if (SYNC_INTERVAL_MS > 0) {
     syncLoop.start(SYNC_INTERVAL_MS);
