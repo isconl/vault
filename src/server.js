@@ -275,8 +275,9 @@ async function main() {
       const { searchParams } = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
       const collection = searchParams.get('collection');
       if (!collection) return sendJson(res, 400, { error: 'collection query param required, e.g. scope/tasks.tsv' });
-      const localRows = store.read(collection);
-      const result = await onedriveSync.checkRemote(graph, collection, localRows);
+      const result = onedriveSync.isTSV(collection)
+        ? await onedriveSync.checkRemote(graph, collection, store.read(collection))
+        : await onedriveSync.checkRemoteRaw(graph, collection, store.rawRead(collection));
       return sendJson(res, result.ok ? 200 : 502, result);
     }
 
@@ -289,8 +290,11 @@ async function main() {
       if (!collection) return sendJson(res, 400, { error: 'collection query param required, e.g. scope/tasks.tsv' });
       let body = {};
       try { body = JSON.parse(await readBody(req) || '{}'); } catch {}
-      const result = await onedriveSync.pullToLocal(graph, store, collection, { force: !!body.force });
-      if (result.ok) auditLog.log('onedrive_pulled', { collection, rows: result.remoteRowCount });
+      const isTSV = onedriveSync.isTSV(collection);
+      const result = isTSV
+        ? await onedriveSync.pullToLocal(graph, store, collection, { force: !!body.force })
+        : await onedriveSync.pullToLocalRaw(graph, store, collection, { force: !!body.force });
+      if (result.ok) auditLog.log('onedrive_pulled', { collection, rows: isTSV ? result.remoteRowCount : undefined, bytes: result.remoteBytes });
       return sendJson(res, result.ok ? 200 : 502, result);
     }
 
