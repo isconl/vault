@@ -120,3 +120,52 @@ test('bootRepair runs the full sequence in order and reports counts from each st
   assert.equal(result.emptyFilesRepaired, 0);
   assert.equal(result.rowsRestored, 0);
 });
+
+test('rawRead/rawWrite round-trip a non-TSV file, and rawWrite keeps the previous version', () => {
+  const { memoryDir, logsDir } = tmpVault();
+  const store = createVaultStore({ memoryDir, logsDir, schema: TEST_SCHEMA });
+
+  assert.equal(store.rawRead('scope/calendar_events.json'), '', 'missing file reads as empty, not throwing');
+
+  store.rawWrite('scope/calendar_events.json', '[{"title":"A"}]');
+  assert.equal(store.rawRead('scope/calendar_events.json'), '[{"title":"A"}]');
+
+  store.rawWrite('scope/calendar_events.json', '[{"title":"A"},{"title":"B"}]');
+  assert.equal(store.rawRead('scope/calendar_events.json'), '[{"title":"A"},{"title":"B"}]');
+  const trashDir = path.join(memoryDir, '.trash');
+  assert.ok(fs.existsSync(trashDir), 'previous version was kept in .trash');
+});
+
+test('rawWrite refuses to blank a file that already had real content, without force', () => {
+  const { memoryDir, logsDir } = tmpVault();
+  const store = createVaultStore({ memoryDir, logsDir, schema: TEST_SCHEMA });
+  store.rawWrite('scope/calendar_events.json', '[{"title":"Real event"}]');
+
+  assert.throws(() => store.rawWrite('scope/calendar_events.json', ''));
+  assert.equal(store.rawRead('scope/calendar_events.json'), '[{"title":"Real event"}]', 'blocked write left the file untouched');
+
+  store.rawWrite('scope/calendar_events.json', '', { force: true });
+  assert.equal(store.rawRead('scope/calendar_events.json'), '', 'force overrides the guard');
+});
+
+test('listDir lists only files directly inside a folder, skipping dotfiles and backup artifacts', () => {
+  const { memoryDir, logsDir } = tmpVault();
+  const store = createVaultStore({ memoryDir, logsDir, schema: TEST_SCHEMA });
+  const dir = path.join(memoryDir, 'learning', 'viva');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, '00-intro.md'), '# Intro');
+  fs.writeFileSync(path.join(dir, '01-deep-dive.md'), '# Deep dive');
+  fs.writeFileSync(path.join(dir, '00-intro.md.backup'), 'old');
+  fs.writeFileSync(path.join(dir, '.DS_Store'), '');
+  fs.mkdirSync(path.join(dir, '_notes'));
+
+  const files = store.listDir('learning/viva');
+  assert.deepEqual(files.map((f) => f.name).sort(), ['00-intro.md', '01-deep-dive.md']);
+  assert.ok(files.every((f) => typeof f.mtimeIso === 'string'));
+});
+
+test('listDir returns [] for a directory that does not exist, not throwing', () => {
+  const { memoryDir, logsDir } = tmpVault();
+  const store = createVaultStore({ memoryDir, logsDir, schema: TEST_SCHEMA });
+  assert.deepEqual(store.listDir('learning/nonexistent-course'), []);
+});

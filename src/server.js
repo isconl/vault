@@ -349,6 +349,28 @@ async function main() {
       return sendJson(res, result.ok ? 200 : 502, result);
     }
 
+    // Lists the files inside one LOCAL vault folder (not OneDrive) -- for
+    // another engine to discover filenames it doesn't know in advance (a
+    // course's lesson .md files) before fetching each via /vault-raw/.
+    if (pathname.startsWith('/vault-dir/') && req.method === 'GET') {
+      const relPath = decodeURIComponent(pathname.slice('/vault-dir/'.length));
+      return sendJson(res, 200, { path: relPath, files: store.listDir(relPath) });
+    }
+
+    // Pulls every file in one remote OneDrive folder into the local vault --
+    // for content whose filenames aren't fixed in advance (a course's lesson
+    // .md files), unlike /onedrive/pull's single known collection path.
+    if (pathname === '/onedrive/pull-folder' && req.method === 'POST') {
+      const { searchParams } = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+      const folder = searchParams.get('path');
+      if (!folder) return sendJson(res, 400, { error: 'path query param required, e.g. learning/viva' });
+      let body = {};
+      try { body = JSON.parse(await readBody(req) || '{}'); } catch {}
+      const result = await onedriveSync.pullFolder(graph, store, folder, { force: !!body.force });
+      if (result.ok) auditLog.log('onedrive_folder_pulled', { folder, files: result.files.length });
+      return sendJson(res, result.ok ? 200 : 502, result);
+    }
+
     if (pathname === '/graph/request' && req.method === 'POST') {
       let body;
       try { body = JSON.parse(await readBody(req) || '{}'); } catch { body = {}; }
