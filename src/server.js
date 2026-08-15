@@ -18,7 +18,7 @@ const http = require('http');
 const path = require('path');
 const secretStore = require('../lib/secrets');
 const { createAuditLog } = require('../lib/audit');
-const { createAuthModule } = require('../lib/auth');
+const { createAuthModule, pinDigest, pinFormatOk } = require('../lib/auth');
 const { createVaultStore } = require('../lib/store');
 const { createGraphClient } = require('../lib/graph');
 const blocksModule = require('../lib/blocks');
@@ -199,6 +199,27 @@ async function main() {
 
     if (pathname === '/secrets/status' && req.method === 'GET') {
       return sendJson(res, 200, secretStore.status());
+    }
+
+    // Set/reset the quick-PIN. Reachable only with an already-valid session
+    // (any of TOTP/PIN/static token, per the auth gate above) -- there is no
+    // separate step-up check because getting here already proves you're the
+    // owner. Persists straight to Bitwarden (persistSecret), not just the
+    // local process cache, so the new PIN survives a restart and reaches
+    // every deploy target reading the same PIN_HASH secret (Render, Oracle,
+    // another dev box) -- setting it only in memory would silently stop
+    // working the moment this process restarts.
+    if (pathname === '/auth/set-pin' && req.method === 'POST') {
+      let newPin = '';
+      try { newPin = JSON.parse(await readBody(req) || '{}').pin || ''; } catch {}
+      if (!pinFormatOk(newPin)) {
+        return sendJson(res, 400, { ok: false, error: `PIN must be digits only, between the configured min and max length` });
+      }
+      const result = await secretStore.persistSecret('PIN_HASH', pinDigest(newPin),
+        `PIN set via console on ${new Date().toISOString()}`);
+      if (!result.ok) return sendJson(res, 502, { ok: false, error: result.error || 'could not write to Bitwarden' });
+      auditLog.log('pin_set', { created: result.created });
+      return sendJson(res, 200, { ok: true });
     }
 
     if (pathname.startsWith('/vault/') && pathname !== '/vault/bootstrap') {
