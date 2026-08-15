@@ -23,6 +23,8 @@ const { createVaultStore } = require('../lib/store');
 const { createGraphClient } = require('../lib/graph');
 const blocksModule = require('../lib/blocks');
 const onedriveSync = require('../lib/onedrive-sync');
+const onedriveBrowse = require('../lib/onedrive-browse');
+const { onThisDay } = require('../lib/onthisday');
 const { createSyncLoop } = require('../lib/sync-loop');
 const manifest = require('../lib/manifest');
 
@@ -394,6 +396,83 @@ async function main() {
       const result = await onedriveSync.pullFolder(graph, store, folder, { force: !!body.force });
       if (result.ok) auditLog.log('onedrive_folder_pulled', { folder, files: result.files.length });
       return sendJson(res, result.ok ? 200 : 502, result);
+    }
+
+    // -- OneDrive file manager: general-purpose browse/CRUD anywhere in the
+    // connected drive, distinct from the known-collection sync routes above.
+    // See lib/onedrive-browse.js's header for why paths here are unprefixed
+    // (relative to the drive root itself, not REMOTE_ROOT).
+    if (pathname === '/onedrive/browse' && req.method === 'GET') {
+      const { searchParams } = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+      const result = await onedriveBrowse.listFolder(graph, searchParams.get('path') || 'root');
+      return sendJson(res, result.ok ? 200 : (result.status || 502), result);
+    }
+    if (pathname === '/onedrive/item' && req.method === 'GET') {
+      const { searchParams } = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+      const id = searchParams.get('id');
+      if (!id) return sendJson(res, 400, { ok: false, error: 'id query param required' });
+      const result = await onedriveBrowse.getItemMeta(graph, id);
+      return sendJson(res, result.ok ? 200 : (result.status || 502), result);
+    }
+    if (pathname === '/onedrive/item-preview' && req.method === 'GET') {
+      const { searchParams } = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+      const id = searchParams.get('id');
+      if (!id) return sendJson(res, 400, { ok: false, error: 'id query param required' });
+      const result = await onedriveBrowse.getItemPreview(graph, id);
+      return sendJson(res, result.ok ? 200 : (result.status || 502), result);
+    }
+    if (pathname === '/onedrive/mkdir' && req.method === 'POST') {
+      let body = {};
+      try { body = JSON.parse(await readBody(req) || '{}'); } catch {}
+      if (!body.folderName) return sendJson(res, 400, { ok: false, error: 'folderName required' });
+      const result = await onedriveBrowse.mkdir(graph, body.parentPath || '', body.folderName);
+      if (result.ok) auditLog.log('onedrive_mkdir', { parentPath: body.parentPath, folderName: body.folderName });
+      return sendJson(res, result.ok ? 200 : 502, result);
+    }
+    if (pathname === '/onedrive/upload' && req.method === 'POST') {
+      let body = {};
+      try { body = JSON.parse(await readBody(req) || '{}'); } catch {}
+      if (!body.fileName) return sendJson(res, 400, { ok: false, error: 'fileName required' });
+      const result = await onedriveBrowse.upload(graph, body.folderPath || '', body.fileName, body.content || '');
+      if (result.ok) auditLog.log('onedrive_upload', { folderPath: body.folderPath, fileName: body.fileName, bytes: Buffer.byteLength(body.content || '', 'utf8') });
+      return sendJson(res, result.ok ? 200 : 502, result);
+    }
+    // POST-with-body, not DELETE-with-query -- matches the file manager
+    // frontend's fmDeleteItem() contract (webconsole/static/app.js), which
+    // predates this backend and was built against the legacy monolith's
+    // own route shape.
+    if (pathname === '/onedrive/item/delete' && req.method === 'POST') {
+      let body = {};
+      try { body = JSON.parse(await readBody(req) || '{}'); } catch {}
+      if (!body.itemId) return sendJson(res, 400, { ok: false, error: 'itemId required' });
+      const result = await onedriveBrowse.deleteItem(graph, body.itemId);
+      if (result.ok) auditLog.log('onedrive_delete', { id: body.itemId });
+      return sendJson(res, result.ok ? 200 : 502, result);
+    }
+    if (pathname === '/onedrive/move' && req.method === 'POST') {
+      let body = {};
+      try { body = JSON.parse(await readBody(req) || '{}'); } catch {}
+      if (!body.itemId) return sendJson(res, 400, { ok: false, error: 'itemId required' });
+      const result = await onedriveBrowse.moveOrRename(graph, body.itemId, { newName: body.newName, toPath: body.toPath });
+      if (result.ok) auditLog.log('onedrive_move', { itemId: body.itemId, newName: body.newName, toPath: body.toPath });
+      return sendJson(res, result.ok ? 200 : 502, result);
+    }
+
+    // Today's curated theme-day phrase, if one has been written for this
+    // date -- {phrase: string|null}. Client falls back to a computed
+    // default when null (see app.js's themePhrase()).
+    if (pathname === '/theme-day' && req.method === 'GET') {
+      const { searchParams } = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+      const date = searchParams.get('date') || new Date().toISOString().slice(0, 10);
+      const row = store.read('scope/theme_days.tsv').find(r => r.DATE === date);
+      return sendJson(res, 200, { date, phrase: row ? row.PHRASE : null });
+    }
+
+    if (pathname === '/onthisday' && req.method === 'GET') {
+      const { searchParams } = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+      const date = searchParams.get('date') || null;
+      if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) return sendJson(res, 400, { error: 'date must be YYYY-MM-DD' });
+      return sendJson(res, 200, onThisDay(store.read, date));
     }
 
     if (pathname === '/graph/request' && req.method === 'POST') {
