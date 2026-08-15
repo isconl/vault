@@ -2,3 +2,9 @@ node_modules/
 runtime/
 *.log
 .env
+
+# Standing rule: this repo is open source and multi-tenant -- code only,
+# never data. memory/ holds this tenant's live vault data (learning
+# content, notifications, per-engine caches); it rehydrates from OneDrive
+# at boot and must never be committed.
+memory/
