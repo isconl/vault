@@ -508,8 +508,7 @@ async function main() {
       try { body = JSON.parse(await readBody(req) || '{}'); } catch {}
       const { course, file, force } = body;
       if (!course || !file) return sendJson(res, 400, { ok: false, error: 'course and file required' });
-      const apiKey = secretStore.get('ELEVENLABS_API_KEY');
-      if (!apiKey) return sendJson(res, 500, { ok: false, error: 'ELEVENLABS_API_KEY not available' });
+      const apiKey = secretStore.get('ELEVENLABS_API_KEY') || '';
 
       let mdText;
       try { mdText = store.rawRead(`learning/${course}/${file}`); } catch { mdText = null; }
