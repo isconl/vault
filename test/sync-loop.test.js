@@ -37,9 +37,12 @@ function fakeAuditLog() {
   return { events, log: (event, data) => events.push({ event, data }) };
 }
 
-test('allCollections includes every schema TSV, the extra finance TSVs, and the raw state files', () => {
+test('allCollections includes every schema TSV (except excluded local-only files), the extra finance TSVs, and the raw state files', () => {
   const { tsv, raw } = allCollections();
-  for (const rel of Object.keys(defaultSchema)) assert.ok(tsv.includes(rel), `missing schema collection ${rel}`);
+  const excluded = ['history/onthisday.tsv', 'scope/theme_days.tsv', 'learning/audio_versions.tsv'];
+  for (const rel of Object.keys(defaultSchema).filter(c => !excluded.includes(c))) {
+    assert.ok(tsv.includes(rel), `missing schema collection ${rel}`);
+  }
   assert.ok(tsv.includes('finance/moves.tsv'));
   assert.ok(tsv.includes('finance/wishlist.tsv'));
   assert.ok(raw.includes('scope/calendar_events.json'));
