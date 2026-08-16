@@ -25,6 +25,7 @@ const blocksModule = require('../lib/blocks');
 const onedriveSync = require('../lib/onedrive-sync');
 const onedriveBrowse = require('../lib/onedrive-browse');
 const { onThisDay } = require('../lib/onthisday');
+const narration = require('../lib/narration');
 const { createSyncLoop } = require('../lib/sync-loop');
 const manifest = require('../lib/manifest');
 
@@ -473,6 +474,92 @@ async function main() {
       const date = searchParams.get('date') || null;
       if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) return sendJson(res, 400, { error: 'date must be YYYY-MM-DD' });
       return sendJson(res, 200, onThisDay(store.read, date));
+    }
+
+    // Narration audio: latest ready version for one module, with a fresh
+    // (Graph downloadUrl's are ~1hr pre-signed) playable url resolved on
+    // every call rather than cached from generation time.
+    if (pathname === '/learning/audio' && req.method === 'GET') {
+      const { searchParams } = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+      const course = searchParams.get('course');
+      const file = searchParams.get('file');
+      if (!course || !file) return sendJson(res, 400, { ok: false, error: 'course and file query params required' });
+      const rows = store.read('learning/audio_versions.tsv')
+        .filter(r => r.COURSE_ID === course && r.LESSON === file && r.STATUS === 'ready')
+        .sort((a, b) => Number(b.VERSION) - Number(a.VERSION));
+      const latest = rows[0];
+      if (!latest) return sendJson(res, 200, { ok: false, generated: false });
+      const item = await onedriveBrowse.getItemMeta(graph, latest.ONEDRIVE_ID);
+      if (!item.ok) return sendJson(res, 502, { ok: false, error: item.error });
+      return sendJson(res, 200, {
+        ok: true, version: Number(latest.VERSION), voiceName: latest.VOICE_NAME,
+        durationSecs: Number(latest.DURATION_SECS) || null, generatedAt: latest.GENERATED_AT,
+        url: item.item.downloadUrl,
+      });
+    }
+
+    // Generate (or regenerate, if the module's text changed since the last
+    // pass) narration audio for one module. Real work -- typically several
+    // seconds to a couple of minutes for a long module -- so callers driving
+    // a course-wide batch should expect this to take a while per module and
+    // not treat a slow response as a failure.
+    if (pathname === '/learning/audio/generate' && req.method === 'POST') {
+      let body = {};
+      try { body = JSON.parse(await readBody(req) || '{}'); } catch {}
+      const { course, file, force } = body;
+      if (!course || !file) return sendJson(res, 400, { ok: false, error: 'course and file required' });
+      const apiKey = secretStore.get('ELEVENLABS_API_KEY');
+      if (!apiKey) return sendJson(res, 500, { ok: false, error: 'ELEVENLABS_API_KEY not available' });
+
+      let mdText;
+      try { mdText = store.rawRead(`learning/${course}/${file}`); } catch { mdText = null; }
+      if (!mdText) return sendJson(res, 404, { ok: false, error: `module not found: learning/${course}/${file}` });
+
+      const hash = narration.contentHash(mdText);
+      const existing = store.read('learning/audio_versions.tsv')
+        .filter(r => r.COURSE_ID === course && r.LESSON === file)
+        .sort((a, b) => Number(b.VERSION) - Number(a.VERSION));
+      const latest = existing[0];
+      if (!force && latest && latest.STATUS === 'ready' && latest.CONTENT_HASH === hash) {
+        return sendJson(res, 200, { ok: true, skipped: true, reason: 'unchanged since last narration', version: Number(latest.VERSION) });
+      }
+
+      const heading = (mdText.match(/^#\s+(.+)$/m) || [, file])[1];
+      const courseRow = store.read('learning/courses.tsv').find(r => r.ID === course);
+      const script = narration.mdToScript(heading, courseRow ? courseRow.TITLE : '', mdText);
+
+      let audioBuffer;
+      try { audioBuffer = await narration.synthesize(script, apiKey); }
+      catch (e) { return sendJson(res, 502, { ok: false, error: String(e.message || e).slice(0, 300) }); }
+
+      const version = latest ? Number(latest.VERSION) + 1 : 1;
+      const moduleId = file.replace(/\.md$/i, '');
+      const folderPath = `Sconl/Core/Apex/Vault/vault-documents/isconl-vault/learning/${course}/_audio/${moduleId}`;
+      const fileName = `v${version}.mp3`;
+      const upload = await onedriveBrowse.uploadLarge(graph, folderPath, fileName, audioBuffer);
+      if (!upload.ok) return sendJson(res, 502, { ok: false, error: upload.error });
+
+      const row = {
+        ID: `AUD-${course}-${moduleId}-v${version}`, COURSE_ID: course, LESSON: file, VERSION: String(version),
+        CONTENT_HASH: hash, VOICE_ID: narration.VOICE_ID, VOICE_NAME: narration.VOICE_NAME,
+        DURATION_SECS: String(Math.round(audioBuffer.length / 16000)),
+        ONEDRIVE_ID: upload.item.id, ONEDRIVE_PATH: `${folderPath}/${fileName}`,
+        GENERATED_AT: new Date().toISOString(), STATUS: 'ready',
+      };
+      store.append('learning/audio_versions.tsv', row);
+      // Keep the manifest itself durable on OneDrive too -- same pattern as
+      // any other push through the general file-manager upload path (see
+      // onedrive-sync.js's header: schema-aware TSV push is deliberately
+      // still not built, but a plain file overwrite via the browse/upload
+      // capability carries the same risk as a user re-saving the file
+      // themselves, and this file only ever grows by one row per call).
+      try {
+        const full = store.rawRead('learning/audio_versions.tsv');
+        await onedriveBrowse.upload(graph, 'Sconl/Core/Apex/Vault/vault-documents/isconl-vault/learning', 'audio_versions.tsv', full);
+      } catch (e) { auditLog.log('audio_manifest_push_failed', { error: String(e.message || e).slice(0, 160) }); }
+
+      auditLog.log('narration_generated', { course, file, version, bytes: audioBuffer.length });
+      return sendJson(res, 200, { ok: true, version, durationSecs: Number(row.DURATION_SECS) });
     }
 
     if (pathname === '/graph/request' && req.method === 'POST') {
