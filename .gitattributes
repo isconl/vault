@@ -1,0 +1,25 @@
+# Force LF for anything that runs as a script or gets parsed by a shell/
+# interpreter -- Windows checkouts with core.autocrlf=true silently flip
+# these to CRLF, which breaks bash parsing on Linux/macOS even when the
+# script is invoked as `bash script.sh` (bypasses the shebang issue but
+# not mid-script \r corruption). Confirmed broke `dev-local.sh` 17 Aug 2026.
+*.sh text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+Dockerfile text eol=lf
+
+# Windows-only scripts keep CRLF -- harmless either way in practice, but
+# explicit is better than relying on core.autocrlf being set the same on
+# every machine this repo is cloned onto.
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Never touch binaries.
+*.png binary
+*.jpg binary
+*.docx binary
+*.pdf binary
