@@ -2,7 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('crypto');
-const { createGraphClient, msGraphTokenExpired } = require('../lib/graph');
+const { createGraphClient, msGraphTokenExpired, httpsRequest } = require('../lib/graph');
 
 function fakeJwt(expiresInSeconds) {
   const b64url = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -123,4 +123,25 @@ test('graphRequest retries on 429 up to the attempt cap and eventually gives up 
   assert.equal(res.status, 429);
   // 1 initial call + 4 retry attempts = 5 total, then it gives up (not infinite).
   assert.equal(graphCalls, 5);
+});
+
+// Found live 17 Aug: a sync pass failed a whole collection with "read
+// ECONNRESET" and no retry at all -- graphRequest's own retry loop above
+// only fires on an HTTP status it actually got back (429/503/509); a
+// connection reset before any response exists never reaches that loop.
+// httpsRequest() (the low-level transport, not graphRequest) now retries
+// transient socket errors itself. No mock here on purpose -- this is the
+// real network path, exercised against a local port nothing is listening
+// on, which reliably raises a real ECONNREFUSED (one of the same
+// transient codes ECONNRESET belongs to) without depending on an actual
+// flaky connection to reproduce.
+test('httpsRequest retries a transient connection error (ECONNREFUSED/ECONNRESET-class) before giving up', async () => {
+  const start = Date.now();
+  await assert.rejects(
+    () => httpsRequest({ hostname: '127.0.0.1', port: 1, path: '/', method: 'GET', timeout: 500 }),
+    (e) => e.code === 'ECONNREFUSED',
+  );
+  // 3 attempts with 400ms/800ms backoff between them = at least ~1200ms
+  // elapsed if the retry actually happened, not just one immediate failure.
+  assert.ok(Date.now() - start >= 1100, 'expected at least two retry waits to have elapsed');
 });
