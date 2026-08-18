@@ -123,6 +123,36 @@ test('pullToLocal respects the massacre guard on an already-populated file, with
   assert.equal(store.read('scope/tasks.tsv').length, 3, 'guard refused the bulk drop -- local rows untouched');
 });
 
+// INC-002 (2026-08-18, see _handoff/INCIDENTS.md): pullToLocal used to
+// report localRowCountAfter as remoteRows.length unconditionally, even when
+// the massacre guard silently refused the write -- making a correctly
+// refused pull look identical to a successful one in every caller's eyes
+// (sync-status logs, /onedrive/check), which is what made a guard that had
+// worked correctly on every single pass look like it had failed.
+test('pullToLocal reports the REAL local row count after a guard-refused write, not the attempted remote count', async () => {
+  const store = tmpStore();
+  store.ensureVault();
+  store.append('scope/tasks.tsv', { ID: '1', TITLE: 'Existing', STATUS: 'open' });
+  store.append('scope/tasks.tsv', { ID: '2', TITLE: 'Existing 2', STATUS: 'open' });
+  store.append('scope/tasks.tsv', { ID: '3', TITLE: 'Existing 3', STATUS: 'open' });
+
+  const graph = fakeGraph({ status: 200, data: 'ID\tTITLE\tSTATUS\n9\tRemote only\topen\n' });
+  const result = await pullToLocal(graph, store, 'scope/tasks.tsv');
+  assert.equal(result.remoteRowCount, 1, 'remote genuinely only had 1 row');
+  assert.equal(result.localRowCountAfter, 3, 'but nothing was actually written -- must not equal remoteRowCount');
+  assert.equal(result.localRowCountBefore, result.localRowCountAfter, 'before/after must match on a refused write');
+  assert.equal(result.refused, true);
+});
+
+test('pullToLocal reports refused:false on a normal successful pull', async () => {
+  const store = tmpStore();
+  store.ensureVault();
+  const graph = fakeGraph({ status: 200, data: 'ID\tTITLE\tSTATUS\n1\tBuy milk\topen\n2\tCall Taylor\topen\n' });
+  const result = await pullToLocal(graph, store, 'scope/tasks.tsv');
+  assert.equal(result.localRowCountAfter, 2);
+  assert.equal(result.refused, false);
+});
+
 test('listRemoteFolder lists file children only, skipping subfolders', async () => {
   const graph = fakeGraphRouter({
     children: { status: 200, data: { value: [
