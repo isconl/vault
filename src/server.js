@@ -465,8 +465,15 @@ async function main() {
       let body = {};
       try { body = JSON.parse(await readBody(req) || '{}'); } catch {}
       if (!body.fileName) return sendJson(res, 400, { ok: false, error: 'fileName required' });
-      const result = await onedriveBrowse.upload(graph, body.folderPath || '', body.fileName, body.content || '');
-      if (result.ok) auditLog.log('onedrive_upload', { folderPath: body.folderPath, fileName: body.fileName, bytes: Buffer.byteLength(body.content || '', 'utf8') });
+      // contentBase64+contentType (binary: docx/pdf) or content (legacy plain
+      // text: md/tsv) -- see onedrive-browse.js's upload() header comment.
+      const result = await onedriveBrowse.upload(graph, body.folderPath || '', body.fileName, body.content || '', {
+        contentBase64: body.contentBase64, contentType: body.contentType,
+      });
+      const bytes = body.contentBase64 !== undefined
+        ? Buffer.byteLength(body.contentBase64, 'base64')
+        : Buffer.byteLength(body.content || '', 'utf8');
+      if (result.ok) auditLog.log('onedrive_upload', { folderPath: body.folderPath, fileName: body.fileName, bytes });
       return sendJson(res, result.ok ? 200 : 502, result);
     }
     // POST-with-body, not DELETE-with-query -- matches the file manager
@@ -539,7 +546,6 @@ async function main() {
       try { body = JSON.parse(await readBody(req) || '{}'); } catch {}
       const { course, file, force } = body;
       if (!course || !file) return sendJson(res, 400, { ok: false, error: 'course and file required' });
-      const apiKey = secretStore.get('ELEVENLABS_API_KEY') || '';
 
       let mdText;
       try { mdText = store.rawRead(`learning/${course}/${file}`); } catch { mdText = null; }
@@ -559,7 +565,7 @@ async function main() {
       const script = narration.mdToScript(heading, courseRow ? courseRow.TITLE : '', mdText);
 
       let audioBuffer;
-      try { audioBuffer = await narration.synthesize(script, apiKey); }
+      try { audioBuffer = await narration.synthesize(script); }
       catch (e) { return sendJson(res, 502, { ok: false, error: String(e.message || e).slice(0, 300) }); }
 
       const version = latest ? Number(latest.VERSION) + 1 : 1;
