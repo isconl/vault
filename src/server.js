@@ -107,6 +107,15 @@ async function main() {
     auditLog,
   });
 
+  // Write-then-push (SYNC1, 2026-08-18): every local vault write now also
+  // pushes that same file up to OneDrive, fire-and-forget, so a local edit
+  // outside the pull loop survives the next scheduled pull instead of being
+  // silently overwritten by it. Wired here (not at store creation, above)
+  // because it needs a live graph client. Safe with sync disabled too --
+  // pushToRemote just fails closed (401) the same as any other Graph call
+  // when there's no token, and firePush only logs that, never throws.
+  store.setPushHook((relPath) => onedriveSync.pushToRemote(graph, store, relPath));
+
   // -- 5.5. OneDrive sync loop (boot-time pull + interval repeat) -------------
   // Off by default -- the test suite calls main() repeatedly with no real
   // Graph credentials configured, and an enabled-by-default loop would fire
@@ -374,6 +383,20 @@ async function main() {
         ? await onedriveSync.pullToLocal(graph, store, collection, { force: !!body.force })
         : await onedriveSync.pullToLocalRaw(graph, store, collection, { force: !!body.force });
       if (result.ok) auditLog.log('onedrive_pulled', { collection, rows: isTSV ? result.remoteRowCount : undefined, bytes: result.remoteBytes });
+      return sendJson(res, result.ok ? 200 : 502, result);
+    }
+
+    // Manually push one collection's current local content up to OneDrive
+    // now, rather than waiting for the next local write to trigger it via
+    // store.js's push hook -- for backfilling a file that was edited before
+    // this existed (BR1/ID1's blocks.tsv/spaces.tsv renames) or force-pushing
+    // after resolving a conflict.
+    if (pathname === '/onedrive/push' && req.method === 'POST') {
+      const { searchParams } = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+      const collection = searchParams.get('collection');
+      if (!collection) return sendJson(res, 400, { error: 'collection query param required, e.g. scope/tasks.tsv' });
+      const result = await onedriveSync.pushToRemote(graph, store, collection);
+      if (result.ok) auditLog.log('onedrive_pushed', { collection, bytes: result.bytes });
       return sendJson(res, result.ok ? 200 : 502, result);
     }
 
