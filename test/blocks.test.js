@@ -86,3 +86,26 @@ test('save() edits a block and rejects an unparseable time', () => {
   assert.throws(() => blocksModule.save({ id: 'BLK-LEARN', start: 'not-a-time' }), /HH:MM/);
   assert.throws(() => blocksModule.save({ id: 'NOPE' }), /no block called/);
 });
+
+// -- U8: block reactivation -------------------------------------------------
+
+test('blocks() hides a deactivated block; allBlocks() still lists it', () => {
+  tmpVault();
+  blocksModule.blocks(); // force seed
+  blocksModule.save({ id: 'BLK-LEARN', active: false });
+  assert.ok(!blocksModule.blocks().some(b => b.id === 'BLK-LEARN'), 'inactive block must not affect placement/scheduling');
+  const all = blocksModule.allBlocks();
+  const learn = all.find(b => b.id === 'BLK-LEARN');
+  assert.ok(learn, 'allBlocks() must still list it so a settings UI can find it to turn back on');
+  assert.equal(learn.active, false);
+  assert.equal(all.length, 4, 'no rows lost, only excluded from the active view');
+});
+
+test('save() can flip a deactivated block back on -- the actual U8 gap, not just visibility', () => {
+  tmpVault();
+  blocksModule.blocks(); // force seed
+  blocksModule.save({ id: 'BLK-LEARN', active: false });
+  assert.ok(!blocksModule.blocks().some(b => b.id === 'BLK-LEARN'));
+  blocksModule.save({ id: 'BLK-LEARN', active: true });
+  assert.ok(blocksModule.blocks().some(b => b.id === 'BLK-LEARN'), 'reactivated block must be back in the placement/scheduling view');
+});

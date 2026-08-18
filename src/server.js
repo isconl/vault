@@ -313,6 +313,14 @@ async function main() {
       const people = store.read('circle/people.tsv');
       return sendJson(res, 200, blocksModule.plan({ tasks, people }));
     }
+    // U8: a management-only listing that includes ACTIVE:no rows, so a
+    // settings screen can show a deactivated block and turn it back on via
+    // POST /blocks (save() already accepts any existing ID -- the missing
+    // piece was ever being able to list one). Deliberately separate from
+    // GET /blocks above, which stays active-only for placement/scheduling.
+    if (pathname === '/blocks/all' && req.method === 'GET') {
+      return sendJson(res, 200, { blocks: blocksModule.allBlocks() });
+    }
     if (pathname === '/blocks' && req.method === 'POST') {
       let patch = {};
       try { patch = JSON.parse(await readBody(req) || '{}'); } catch {}
