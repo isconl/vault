@@ -169,3 +169,67 @@ test('listDir returns [] for a directory that does not exist, not throwing', () 
   const store = createVaultStore({ memoryDir, logsDir, schema: TEST_SCHEMA });
   assert.deepEqual(store.listDir('learning/nonexistent-course'), []);
 });
+
+// -- write-then-push hook (SYNC1) -----------------------------------------
+
+test('append fires the push hook with the written collection after a successful write', async () => {
+  const { memoryDir, logsDir } = tmpVault();
+  const store = createVaultStore({ memoryDir, logsDir, schema: TEST_SCHEMA });
+  store.ensureVault();
+  const pushed = [];
+  store.setPushHook((relPath) => { pushed.push(relPath); return { ok: true }; });
+  store.append('scope/tasks.tsv', { ID: '1', TITLE: 'Buy milk', STATUS: 'open' });
+  await new Promise((r) => setImmediate(r));   // firePush is fire-and-forget
+  assert.deepEqual(pushed, ['scope/tasks.tsv']);
+});
+
+test('append does not fire the push hook when the write itself was a no-op (unknown file, no header)', async () => {
+  const { memoryDir, logsDir } = tmpVault();
+  const store = createVaultStore({ memoryDir, logsDir, schema: {} });   // no schema entry -> no headerIfMissing
+  const pushed = [];
+  store.setPushHook((relPath) => { pushed.push(relPath); return { ok: true }; });
+  store.append('scope/unknown.tsv', { ID: '1' });
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(pushed, []);
+});
+
+test('rewrite fires the push hook after writing', async () => {
+  const { memoryDir, logsDir } = tmpVault();
+  const store = createVaultStore({ memoryDir, logsDir, schema: TEST_SCHEMA });
+  store.ensureVault();
+  store.append('scope/tasks.tsv', { ID: '1', TITLE: 'Buy milk', STATUS: 'open' });
+  const pushed = [];
+  store.setPushHook((relPath) => { pushed.push(relPath); return { ok: true }; });
+  store.rewrite('scope/tasks.tsv', (rows) => rows.map((r) => ({ ...r, STATUS: 'done' })));
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(pushed, ['scope/tasks.tsv']);
+});
+
+test('rawWrite fires the push hook after writing', async () => {
+  const { memoryDir, logsDir } = tmpVault();
+  const store = createVaultStore({ memoryDir, logsDir, schema: TEST_SCHEMA });
+  const pushed = [];
+  store.setPushHook((relPath) => { pushed.push(relPath); return { ok: true }; });
+  store.rawWrite('scope/state.json', '{"a":1}');
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(pushed, ['scope/state.json']);
+});
+
+test('a push hook rejection is caught and logged, never thrown back at the caller', async () => {
+  const { memoryDir, logsDir } = tmpVault();
+  const logs = [];
+  const store = createVaultStore({ memoryDir, logsDir, schema: TEST_SCHEMA, auditLog: { log: (e, d) => logs.push([e, d]) } });
+  store.ensureVault();
+  store.setPushHook(() => Promise.reject(new Error('network down')));
+  assert.doesNotThrow(() => store.append('scope/tasks.tsv', { ID: '1', TITLE: 'Buy milk', STATUS: 'open' }));
+  await new Promise((r) => setImmediate(r));
+  assert.ok(logs.some(([e]) => e === 'vault_push_after_write_failed'));
+});
+
+test('with no push hook set, writes behave exactly as before (no error, nothing called)', () => {
+  const { memoryDir, logsDir } = tmpVault();
+  const store = createVaultStore({ memoryDir, logsDir, schema: TEST_SCHEMA });
+  store.ensureVault();
+  assert.doesNotThrow(() => store.append('scope/tasks.tsv', { ID: '1', TITLE: 'Buy milk', STATUS: 'open' }));
+  assert.equal(store.read('scope/tasks.tsv').length, 1);
+});

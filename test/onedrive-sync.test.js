@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { checkRemote, fetchRemoteText, pullToLocal, listRemoteFolder, pullFolder, REMOTE_ROOT } = require('../lib/onedrive-sync');
+const { checkRemote, fetchRemoteText, pullToLocal, listRemoteFolder, pullFolder, pushToRemote, REMOTE_ROOT } = require('../lib/onedrive-sync');
 const { createVaultStore } = require('../lib/store');
 
 function fakeGraph(response) {
@@ -191,4 +191,37 @@ test('pullFolder records a per-file failure without losing the files that did su
   assert.equal(broken.ok, false);
   assert.equal(intro.ok, true);
   assert.equal(store.rawRead('learning/viva/00-intro.md'), '# Intro');
+});
+
+test('pushToRemote PUTs the local file\'s current bytes to REMOTE_ROOT/relPath', async () => {
+  const store = tmpStore();
+  store.ensureVault();
+  store.append('scope/tasks.tsv', { ID: '1', TITLE: 'Buy milk', STATUS: 'open' });
+  const local = store.rawRead('scope/tasks.tsv');
+
+  const graph = fakeGraph({ status: 200, data: {} });
+  const result = await pushToRemote(graph, store, 'scope/tasks.tsv');
+
+  assert.equal(result.ok, true);
+  assert.equal(result.bytes, Buffer.byteLength(local, 'utf8'));
+  assert.equal(graph.calls.length, 1);
+  assert.ok(graph.calls[0].includes('scope'), 'request path includes the collection');
+});
+
+test('pushToRemote refuses to push an empty/missing local file rather than blanking the remote', async () => {
+  const store = tmpStore();
+  const graph = fakeGraph({ status: 200, data: {} });
+  const result = await pushToRemote(graph, store, 'scope/tasks.tsv');
+  assert.equal(result.ok, false);
+  assert.equal(graph.calls.length, 0, 'never called Graph at all -- refused before the request');
+});
+
+test('pushToRemote reports a non-2xx Graph response as ok:false, never throws', async () => {
+  const store = tmpStore();
+  store.ensureVault();
+  store.append('scope/tasks.tsv', { ID: '1', TITLE: 'Buy milk', STATUS: 'open' });
+  const graph = fakeGraph({ status: 401, data: { error: { message: 'Microsoft 365 not connected.' } } });
+  const result = await pushToRemote(graph, store, 'scope/tasks.tsv');
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 401);
 });
