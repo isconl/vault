@@ -27,6 +27,7 @@ const onedriveBrowse = require('../lib/onedrive-browse');
 const { onThisDay } = require('../lib/onthisday');
 const narration = require('../lib/narration');
 const { createSyncLoop } = require('../lib/sync-loop');
+const corporateDiscovery = require('../lib/corporate-discovery');
 const manifest = require('../lib/manifest');
 
 const PORT = parseInt(process.env.VAULT_PORT || process.env.PORT || '8081', 10);
@@ -127,7 +128,9 @@ async function main() {
   // repo at all, and Bitwarden is the one config source every deployment
   // path already depends on (see _handoff/migration-log.md, 2026-08-14).
   const SYNC_INTERVAL_MS = parseInt(process.env.VAULT_SYNC_INTERVAL_MS || secretStore.get('VAULT_SYNC_INTERVAL_MS') || '0', 10);
-  const syncLoop = createSyncLoop({ onedriveSync, graph, store, auditLog });
+  const CIRCLE_URL = process.env.CIRCLE_URL || '';
+  const CIRCLE_TOKEN = process.env.CIRCLE_TOKEN || secretStore.get('CIRCLE_TOKEN') || '';
+  const syncLoop = createSyncLoop({ onedriveSync, graph, store, auditLog, corporateDiscovery, circleUrl: CIRCLE_URL, circleToken: CIRCLE_TOKEN });
   if (SYNC_INTERVAL_MS > 0) {
     syncLoop.start(SYNC_INTERVAL_MS);
     console.log(`  onedrive sync: enabled, every ${Math.round(SYNC_INTERVAL_MS / 1000)}s`);
