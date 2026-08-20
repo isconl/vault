@@ -135,6 +135,37 @@ test('graphRequest retries on 429 up to the attempt cap and eventually gives up 
 // on, which reliably raises a real ECONNREFUSED (one of the same
 // transient codes ECONNRESET belongs to) without depending on an actual
 // flaky connection to reproduce.
+// FI26082001: found live 20 Aug -- a caller passed a plain object body
+// (instead of JSON.stringify()-ing it first) to graphRequest(), which
+// reached req.write() raw inside httpsRequestOnce and threw a synchronous,
+// uncaught TypeError that killed the whole vault process (and everything
+// depending on it: pulse/scope/circle/spark/hub). graphRequest() now
+// normalizes a non-string/Buffer body itself, so this must resolve (via
+// auto-serialization) rather than reject or crash the test process.
+test('graphRequest auto-serializes a plain-object body instead of crashing on a raw req.write()', async () => {
+  const seen = [];
+  const { client, getConfig } = makeClient({
+    httpsRequestFn: async (options, body) => { seen.push(body); return { status: 200, data: { ok: true } }; },
+  });
+  getConfig().accessToken = fakeJwt(3600);
+  const res = await client.graphRequest('/v1.0/me/drive/root/children', {
+    method: 'POST',
+    body: { name: 'test-object-body' },   // deliberately an object, not a pre-serialized string
+  });
+  assert.equal(res.status, 200);
+  assert.equal(typeof seen[0], 'string', 'the body handed to the transport must already be a string');
+  assert.deepEqual(JSON.parse(seen[0]), { name: 'test-object-body' });
+});
+
+test('httpsRequestOnce rejects (rather than throwing synchronously/crashing the process) when req.write() is given a bad postData type', async () => {
+  // A plain object slipping past graphRequest's normalization (e.g. a
+  // direct httpsRequestOnce/httpsRequest caller) must still fail as a
+  // rejected promise, not an uncaught exception.
+  await assert.rejects(
+    () => httpsRequest({ hostname: '127.0.0.1', port: 1, path: '/', method: 'POST' }, { not: 'a string or buffer' }),
+  );
+});
+
 test('httpsRequest retries a transient connection error (ECONNREFUSED/ECONNRESET-class) before giving up', async () => {
   const start = Date.now();
   await assert.rejects(
