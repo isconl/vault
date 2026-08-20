@@ -252,10 +252,16 @@ async function main() {
       // locally, translated to something an HTTP body can carry (a function
       // can't cross the wire; a full row array can).
       if (req.method === 'PUT') {
-        let rows = [];
-        try { rows = JSON.parse(await readBody(req) || '{}').rows; } catch {}
+        let body = {};
+        try { body = JSON.parse(await readBody(req) || '{}'); } catch {}
+        const rows = body.rows;
         if (!Array.isArray(rows)) return sendJson(res, 400, { ok: false, error: 'body must be {"rows": [...]}' });
-        const removed = store.rewrite(collection, () => rows);
+        // force was previously never forwarded from the body -- the massacre
+        // guard silently refused any bulk replace/delete over half the rows
+        // while this route still answered {ok:true, removed:0}, making a
+        // refused write indistinguishable from a successful no-op one.
+        // Found live 20 Aug purging test rows via this exact route.
+        const removed = store.rewrite(collection, () => rows, { force: !!body.force, why: 'PUT /vault/:collection' });
         return sendJson(res, 200, { ok: true, collection, count: rows.length, removed });
       }
     }
