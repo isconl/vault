@@ -21,6 +21,7 @@ const { createAuditLog } = require('../lib/audit');
 const { createAuthModule, pinDigest, pinFormatOk } = require('../lib/auth');
 const { createVaultStore } = require('../lib/store');
 const { createGraphClient } = require('../lib/graph');
+const { createGoogleClient } = require('../lib/google');
 const blocksModule = require('../lib/blocks');
 const onedriveSync = require('../lib/onedrive-sync');
 const onedriveBrowse = require('../lib/onedrive-browse');
@@ -107,6 +108,36 @@ async function main() {
     },
     auditLog,
   });
+
+  // -- 5.1. Google client (BI26082005) ---------------------------------------
+  // Multi-account by design (the row's own requirement) -- one client per
+  // account label, secrets keyed by label so a second account is just a
+  // second entry in this Map, never a schema change. Only the label(s)
+  // named in GOOGLE_ACCOUNTS actually get a client instantiated; the known
+  // account so far is a single one (sconl.vv@gmail.com, per the Corporate
+  // Engagements plan), so this defaults to one label, 'default', if unset.
+  const GOOGLE_ACCOUNT_LABELS = (process.env.GOOGLE_ACCOUNTS || 'default').split(',').map(s => s.trim()).filter(Boolean);
+  const googleClients = new Map();
+  for (const label of GOOGLE_ACCOUNT_LABELS) {
+    const secretKey = (name) => `GOOGLE_${name}__${label.toUpperCase()}`;
+    let googleConfig = {
+      // client_id/secret are per Google Cloud OAuth app, not per account --
+      // shared across every label unless a label-specific override exists.
+      clientId: process.env.GOOGLE_CLIENT_ID || secretStore.get('GOOGLE_CLIENT_ID') || '',
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET || secretStore.get('GOOGLE_CLIENT_SECRET') || '',
+      accessToken: '',
+      refreshToken: secretStore.get(secretKey('REFRESH_TOKEN')) || '',
+      tokenExpiresAt: 0,
+    };
+    googleClients.set(label, createGoogleClient({
+      getConfig: () => googleConfig,
+      setConfig: (patch) => { googleConfig = { ...googleConfig, ...patch }; },
+      onTokenRefreshed: async (accessToken, refreshToken) => {
+        await secretStore.persistSecret(secretKey('REFRESH_TOKEN'), refreshToken, `Rotated by vault on token refresh (${label})`);
+      },
+      auditLog,
+    }));
+  }
 
   // Write-then-push (SYNC1, 2026-08-18): every local vault write now also
   // pushes that same file up to OneDrive, fire-and-forget, so a local edit
@@ -365,6 +396,47 @@ async function main() {
       if (r.success) return sendJson(res, 200, { ok: true, connected: true });
       // authorization_pending / slow_down are the "keep polling" states, not
       // real failures -- everything else (expired_token, access_denied) is.
+      const err = r.data?.error || '';
+      if (err === 'authorization_pending' || err === 'slow_down') {
+        return sendJson(res, 200, { ok: true, connected: false, waiting: true });
+      }
+      return sendJson(res, 200, { ok: true, connected: false, waiting: false, error: r.data?.error_description || err });
+    }
+
+    // Google device-code sign-in (BI26082005) -- same shape/contract as the
+    // Microsoft pair above, one account label at a time. `account` defaults
+    // to 'default' (the only label instantiated unless GOOGLE_ACCOUNTS names
+    // more) so an existing single-account caller doesn't need to know the
+    // multi-account plumbing exists at all.
+    if (pathname === '/google/auth/start' && req.method === 'POST') {
+      let account = 'default';
+      try { account = JSON.parse(await readBody(req) || '{}').account || 'default'; } catch {}
+      const google = googleClients.get(account);
+      if (!google) return sendJson(res, 400, { ok: false, error: `unknown Google account '${account}'` });
+      const data = await google.startDeviceCodeAuth();
+      if (!data?.device_code) return sendJson(res, 502, { ok: false, error: data?.error_description || 'could not start device code sign-in' });
+      return sendJson(res, 200, {
+        ok: true,
+        userCode: data.user_code,
+        verificationUri: data.verification_url || data.verification_uri_complete,
+        expiresInSec: data.expires_in,
+        deviceCode: data.device_code,
+        pollIntervalSec: data.interval || 5,
+      });
+    }
+    if (pathname === '/google/auth/poll' && req.method === 'POST') {
+      let account = 'default';
+      let deviceCode = '';
+      try {
+        const p = JSON.parse(await readBody(req) || '{}');
+        account = p.account || 'default';
+        deviceCode = p.deviceCode || '';
+      } catch {}
+      if (!deviceCode) return sendJson(res, 400, { ok: false, error: 'deviceCode required' });
+      const google = googleClients.get(account);
+      if (!google) return sendJson(res, 400, { ok: false, error: `unknown Google account '${account}'` });
+      const r = await google.pollDeviceCodeAuth(deviceCode);
+      if (r.success) return sendJson(res, 200, { ok: true, connected: true });
       const err = r.data?.error || '';
       if (err === 'authorization_pending' || err === 'slow_down') {
         return sendJson(res, 200, { ok: true, connected: false, waiting: true });
