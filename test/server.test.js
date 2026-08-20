@@ -131,6 +131,42 @@ test('PUT /vault/:collection replaces the whole row set -- the read-modify-write
   } finally { server.close(); cleanup(); }
 });
 
+test('PUT /vault/:collection forwards force:true so a legitimate bulk delete over half the rows actually happens, not silently refused', async () => {
+  const { server, port, cleanup } = await startServer();
+  try {
+    for (const t of [{ ID: 'T1' }, { ID: 'T2' }, { ID: 'T3' }]) {
+      await fetch(`http://127.0.0.1:${port}/vault/scope%2Ftasks.tsv`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer test-static-token', 'Content-Type': 'application/json' },
+        body: JSON.stringify(t),
+      });
+    }
+    // Without force: the massacre guard should refuse (removing 3 of 3).
+    const refused = await fetch(`http://127.0.0.1:${port}/vault/scope%2Ftasks.tsv`, {
+      method: 'PUT',
+      headers: { Authorization: 'Bearer test-static-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rows: [] }),
+    });
+    assert.equal((await refused.json()).removed, 0);
+    let read = await (await fetch(`http://127.0.0.1:${port}/vault/scope%2Ftasks.tsv`, {
+      headers: { Authorization: 'Bearer test-static-token' },
+    })).json();
+    assert.equal(read.rows.length, 3);
+
+    // With force:true: the same request should actually take effect.
+    const forced = await fetch(`http://127.0.0.1:${port}/vault/scope%2Ftasks.tsv`, {
+      method: 'PUT',
+      headers: { Authorization: 'Bearer test-static-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rows: [], force: true }),
+    });
+    assert.equal((await forced.json()).removed, 3);
+    read = await (await fetch(`http://127.0.0.1:${port}/vault/scope%2Ftasks.tsv`, {
+      headers: { Authorization: 'Bearer test-static-token' },
+    })).json();
+    assert.equal(read.rows.length, 0);
+  } finally { server.close(); cleanup(); }
+});
+
 test('PUT /vault/:collection rejects a non-array rows body', async () => {
   const { server, port, cleanup } = await startServer();
   try {
