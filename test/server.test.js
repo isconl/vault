@@ -40,6 +40,10 @@ async function startServer(envOverrides = {}) {
     // machine that DOES have real Bitwarden creds in its ambient env this
     // would otherwise fire real Graph calls during every test run.
     VAULT_SYNC_INTERVAL_MS: '0',
+    // Same reasoning as VAULT_SYNC_INTERVAL_MS above, for BM26082011's
+    // Gmail sync loop -- explicit off in tests, not left to its 5-minute
+    // default.
+    EMAIL_SYNC_DISABLED: '1',
     ...envOverrides,
   });
   delete require.cache[require.resolve('../src/server')];
@@ -241,5 +245,54 @@ test('the audit log actually recorded the requests made during this test run', a
     });
     const chain = auditLog.verifyChain();
     assert.equal(chain.ok, true);
+  } finally { server.close(); cleanup(); }
+});
+
+test('POST /google/send returns a clean 502 (never a crash) when no Google account is connected', async () => {
+  const { server, port, cleanup } = await startServer();
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/google/send`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer test-static-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to: 'alex@example.com', subject: 'Re: proposal', body: 'sounds good' }),
+    });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.equal(body.ok, false);
+  } finally { server.close(); cleanup(); }
+});
+
+test('POST /google/send with an unknown account label is a clean 400, not a 500', async () => {
+  const { server, port, cleanup } = await startServer();
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/google/send`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer test-static-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ account: 'does-not-exist', to: 'x@example.com', subject: 's', body: 'b' }),
+    });
+    assert.equal(res.status, 400);
+  } finally { server.close(); cleanup(); }
+});
+
+test('POST /google/auth/start for the default account fails soft (502) with no client_id configured, not a crash', async () => {
+  const { server, port, cleanup } = await startServer();
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/google/auth/start`, {
+      method: 'POST', headers: { Authorization: 'Bearer test-static-token', 'Content-Type': 'application/json' }, body: '{}',
+    });
+    assert.equal(res.status, 502);
+  } finally { server.close(); cleanup(); }
+});
+
+test('GET /manifest lists the new google.* capabilities', async () => {
+  const { server, port, cleanup } = await startServer();
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/manifest`);
+    const body = await res.json();
+    const names = body.capabilities.map(c => c.name);
+    assert.ok(names.includes('google.auth.start'));
+    assert.ok(names.includes('google.auth.poll'));
+    assert.ok(names.includes('google.send'));
+    assert.ok(names.includes('google.sync.all'));
   } finally { server.close(); cleanup(); }
 });
