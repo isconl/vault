@@ -48,6 +48,17 @@ function readBody(req) {
   });
 }
 
+// Raw binary body as a Buffer -- for large-file upload, where routing
+// through JSON+base64 would waste ~33% memory/bandwidth for no benefit.
+function readRawBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
 function sendJson(res, status, obj) {
   res.writeHead(status, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(obj));
@@ -610,6 +621,20 @@ async function main() {
         ? Buffer.byteLength(body.contentBase64, 'base64')
         : Buffer.byteLength(body.content || '', 'utf8');
       if (result.ok) auditLog.log('onedrive_upload', { folderPath: body.folderPath, fileName: body.fileName, bytes });
+      return sendJson(res, result.ok ? 200 : 502, result);
+    }
+    // Large binary upload (over Graph's 4MB simple-PUT ceiling) via a
+    // resumable session -- onedriveBrowse.uploadLarge(), previously wired
+    // only for TTS narration audio. folderPath/fileName come as query
+    // params since the body IS the raw file content, not JSON.
+    if (pathname === '/onedrive/upload-large' && req.method === 'POST') {
+      const qs = new URL(req.url, `http://${req.headers.host || 'localhost'}`).searchParams;
+      const folderPath = qs.get('folderPath') || '';
+      const fileName = qs.get('fileName') || '';
+      if (!fileName) return sendJson(res, 400, { ok: false, error: 'fileName required' });
+      const buf = await readRawBody(req);
+      const result = await onedriveBrowse.uploadLarge(graph, folderPath, fileName, buf);
+      if (result.ok) auditLog.log('onedrive_upload_large', { folderPath, fileName, bytes: buf.length });
       return sendJson(res, result.ok ? 200 : 502, result);
     }
     // POST-with-body, not DELETE-with-query -- matches the file manager
