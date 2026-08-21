@@ -22,6 +22,8 @@ const { createAuthModule, pinDigest, pinFormatOk } = require('../lib/auth');
 const { createVaultStore } = require('../lib/store');
 const { createGraphClient } = require('../lib/graph');
 const { createGoogleClient } = require('../lib/google');
+const gmail = require('../lib/gmail');
+const { createGmailSyncLoop } = require('../lib/gmail-sync');
 const blocksModule = require('../lib/blocks');
 const onedriveSync = require('../lib/onedrive-sync');
 const onedriveBrowse = require('../lib/onedrive-browse');
@@ -167,6 +169,21 @@ async function main() {
     console.log(`  onedrive sync: enabled, every ${Math.round(SYNC_INTERVAL_MS / 1000)}s`);
   } else {
     console.log('  onedrive sync: disabled (set VAULT_SYNC_INTERVAL_MS to enable)');
+  }
+
+  // -- 5.6. Gmail sync loop (BM26082011) --------------------------------------
+  // Own interval, independent of the OneDrive one above -- polling Gmail on
+  // OneDrive's cadence (or vice versa) would be a coincidence, not a design
+  // choice. Defaults to 5 minutes per the row's own spec; disabled the same
+  // way the OneDrive loop is (0 = off) so the test suite's repeated main()
+  // calls don't fire real Gmail polls with no credentials configured.
+  const EMAIL_SYNC_INTERVAL_MS = parseInt(process.env.EMAIL_SYNC_INTERVAL_MS || secretStore.get('EMAIL_SYNC_INTERVAL_MS') || String(5 * 60 * 1000), 10);
+  const gmailSyncLoop = createGmailSyncLoop({ googleClients, gmail, store, auditLog });
+  if (EMAIL_SYNC_INTERVAL_MS > 0 && process.env.EMAIL_SYNC_DISABLED !== '1') {
+    gmailSyncLoop.start(EMAIL_SYNC_INTERVAL_MS);
+    console.log(`  gmail sync: enabled, every ${Math.round(EMAIL_SYNC_INTERVAL_MS / 1000)}s (${GOOGLE_ACCOUNT_LABELS.length} account label(s))`);
+  } else {
+    console.log('  gmail sync: disabled (EMAIL_SYNC_DISABLED=1 or EMAIL_SYNC_INTERVAL_MS<=0)');
   }
 
   // -- 6. FAIL CLOSED bind guard (same rule as the monolith this was extracted from) --
@@ -442,6 +459,44 @@ async function main() {
         return sendJson(res, 200, { ok: true, connected: false, waiting: true });
       }
       return sendJson(res, 200, { ok: true, connected: false, waiting: false, error: r.data?.error_description || err });
+    }
+
+    // Send a reply/new message (BM26082011). On a successful send, also
+    // files the sent copy into scope/inbox.tsv as an outbound row -- done
+    // HERE (not by the caller) since vault already holds direct store
+    // access to that TSV, same reasoning gmail-sync.js writes inbound rows
+    // directly rather than round-tripping through another engine's route
+    // (and circle's own generic addMessage doesn't populate PERSON_ID/
+    // DIRECTION at all -- confirmed 21 Aug, logged as a fresh fix.md row
+    // rather than depended on here).
+    if (pathname === '/google/send' && req.method === 'POST') {
+      let p = {};
+      try { p = JSON.parse(await readBody(req) || '{}'); } catch {}
+      const google = googleClients.get(p.account || 'default');
+      if (!google) return sendJson(res, 400, { ok: false, error: `unknown Google account '${p.account || 'default'}'` });
+      const r = await gmail.sendMessage(google, { to: p.to, subject: p.subject, body: p.body, threadId: p.threadId, inReplyTo: p.inReplyTo });
+      if (!r.ok) return sendJson(res, 502, r);
+      try {
+        const rows = store.read('scope/inbox.tsv');
+        const nextIdNum = rows.reduce((n, row) => Math.max(n, parseInt(String(row.ID).replace(/\D/g, ''), 10) || 0), 0) + 1;
+        store.append('scope/inbox.tsv', {
+          ID: `I${String(nextIdNum).padStart(3, '0')}`,
+          TITLE: p.subject || '(no subject)', BODY: p.body || '-', STATUS: 'seen',
+          SOURCE: `gmail:${p.account || 'default'}:sent:${r.id}`,
+          CAPTURED_AT: new Date().toISOString().slice(0, 10), CHANNEL: 'gmail',
+          SENDER: '-', SUBJECT: p.subject || '-', RECEIVED_AT: new Date().toISOString().slice(0, 16),
+          TAG: '-', COMMENT: '-', PERSON_ID: p.personId || '-', DIRECTION: 'out',
+        });
+      } catch (e) {
+        auditLog.log('gmail_sent_copy_file_failed', { error: String(e.message || e).slice(0, 200) });
+      }
+      return sendJson(res, 200, r);
+    }
+    if (pathname === '/google/sync-all' && req.method === 'POST') {
+      // Manual trigger, same reasoning as /onedrive/sync-all above -- lets a
+      // caller (or a test) force one pass without waiting on the interval.
+      const results = await gmailSyncLoop.runOnce();
+      return sendJson(res, 200, { ok: true, results });
     }
 
     // Read-only OneDrive verification: compares the real remote copy of one
