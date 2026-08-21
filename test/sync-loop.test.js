@@ -157,3 +157,42 @@ test('no courses in learning/courses.tsv (or store.read throwing) means zero fol
   assert.equal(onedriveSync.folderCalls.length, 0);
   assert.equal(result.failed.length, 0);
 });
+
+test('runOnce skips the corporate-discovery pass entirely when corporateDiscovery/circleUrl are not configured', async () => {
+  const onedriveSync = fakeOnedriveSync();
+  const loop = createSyncLoop({ onedriveSync, graph: {}, store: fakeStoreWithCourses([]), delayMs: 0 });
+  const result = await loop.runOnce();
+  assert.ok(!result.ok.find((r) => r.collection === 'corporate-discovery'));
+  assert.ok(!result.failed.find((r) => r.collection === 'corporate-discovery'));
+});
+
+test('runOnce runs discoverOrgs then pushDiscoveredOrgs and records a corporate-discovery entry on success', async () => {
+  const onedriveSync = fakeOnedriveSync();
+  const calls = [];
+  const corporateDiscovery = {
+    discoverOrgs: async (graph) => { calls.push('discover'); return { ok: true, orgs: [{ id: 'viva-valentia', name: 'Viva Valentia', discoveryDate: '2026-08-20' }] }; },
+    pushDiscoveredOrgs: async (orgs, opts) => { calls.push(`push:${orgs.length}:${opts.circleUrl}`); return { ok: true, created: ['viva-valentia'], skipped: [] }; },
+  };
+  const loop = createSyncLoop({ onedriveSync, graph: {}, store: fakeStoreWithCourses([]), delayMs: 0, corporateDiscovery, circleUrl: 'http://127.0.0.1:9', circleToken: 'tok' });
+  const result = await loop.runOnce();
+  assert.deepEqual(calls, ['discover', 'push:1:http://127.0.0.1:9']);
+  const entry = result.ok.find((r) => r.collection === 'corporate-discovery');
+  assert.ok(entry);
+  assert.equal(entry.orgsSeen, 1);
+  assert.deepEqual(entry.created, ['viva-valentia']);
+});
+
+test('runOnce records corporate-discovery as failed (without blocking the rest of the pass) when discovery itself fails', async () => {
+  const onedriveSync = fakeOnedriveSync();
+  const corporateDiscovery = {
+    discoverOrgs: async () => ({ ok: false, error: 'itemNotFound' }),
+    pushDiscoveredOrgs: async () => { throw new Error('should not be called'); },
+  };
+  const loop = createSyncLoop({ onedriveSync, graph: {}, store: fakeStoreWithCourses([]), delayMs: 0, corporateDiscovery, circleUrl: 'http://127.0.0.1:9' });
+  const result = await loop.runOnce();
+  const entry = result.failed.find((r) => r.collection === 'corporate-discovery');
+  assert.ok(entry);
+  assert.equal(entry.error, 'itemNotFound');
+  // Every regular TSV/raw collection still ran.
+  assert.ok(result.ok.some((r) => r.collection));
+});

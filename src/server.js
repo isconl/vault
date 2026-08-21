@@ -21,12 +21,16 @@ const { createAuditLog } = require('../lib/audit');
 const { createAuthModule, pinDigest, pinFormatOk } = require('../lib/auth');
 const { createVaultStore } = require('../lib/store');
 const { createGraphClient } = require('../lib/graph');
+const { createGoogleClient } = require('../lib/google');
+const gmail = require('../lib/gmail');
+const { createGmailSyncLoop } = require('../lib/gmail-sync');
 const blocksModule = require('../lib/blocks');
 const onedriveSync = require('../lib/onedrive-sync');
 const onedriveBrowse = require('../lib/onedrive-browse');
 const { onThisDay } = require('../lib/onthisday');
 const narration = require('../lib/narration');
 const { createSyncLoop } = require('../lib/sync-loop');
+const corporateDiscovery = require('../lib/corporate-discovery');
 const manifest = require('../lib/manifest');
 
 const PORT = parseInt(process.env.VAULT_PORT || process.env.PORT || '8081', 10);
@@ -107,6 +111,36 @@ async function main() {
     auditLog,
   });
 
+  // -- 5.1. Google client (BI26082005) ---------------------------------------
+  // Multi-account by design (the row's own requirement) -- one client per
+  // account label, secrets keyed by label so a second account is just a
+  // second entry in this Map, never a schema change. Only the label(s)
+  // named in GOOGLE_ACCOUNTS actually get a client instantiated; the known
+  // account so far is a single one (sconl.vv@gmail.com, per the Corporate
+  // Engagements plan), so this defaults to one label, 'default', if unset.
+  const GOOGLE_ACCOUNT_LABELS = (process.env.GOOGLE_ACCOUNTS || 'default').split(',').map(s => s.trim()).filter(Boolean);
+  const googleClients = new Map();
+  for (const label of GOOGLE_ACCOUNT_LABELS) {
+    const secretKey = (name) => `GOOGLE_${name}__${label.toUpperCase()}`;
+    let googleConfig = {
+      // client_id/secret are per Google Cloud OAuth app, not per account --
+      // shared across every label unless a label-specific override exists.
+      clientId: process.env.GOOGLE_CLIENT_ID || secretStore.get('GOOGLE_CLIENT_ID') || '',
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET || secretStore.get('GOOGLE_CLIENT_SECRET') || '',
+      accessToken: '',
+      refreshToken: secretStore.get(secretKey('REFRESH_TOKEN')) || '',
+      tokenExpiresAt: 0,
+    };
+    googleClients.set(label, createGoogleClient({
+      getConfig: () => googleConfig,
+      setConfig: (patch) => { googleConfig = { ...googleConfig, ...patch }; },
+      onTokenRefreshed: async (accessToken, refreshToken) => {
+        await secretStore.persistSecret(secretKey('REFRESH_TOKEN'), refreshToken, `Rotated by vault on token refresh (${label})`);
+      },
+      auditLog,
+    }));
+  }
+
   // Write-then-push (SYNC1, 2026-08-18): every local vault write now also
   // pushes that same file up to OneDrive, fire-and-forget, so a local edit
   // outside the pull loop survives the next scheduled pull instead of being
@@ -127,12 +161,29 @@ async function main() {
   // repo at all, and Bitwarden is the one config source every deployment
   // path already depends on (see _handoff/migration-log.md, 2026-08-14).
   const SYNC_INTERVAL_MS = parseInt(process.env.VAULT_SYNC_INTERVAL_MS || secretStore.get('VAULT_SYNC_INTERVAL_MS') || '0', 10);
-  const syncLoop = createSyncLoop({ onedriveSync, graph, store, auditLog });
+  const CIRCLE_URL = process.env.CIRCLE_URL || '';
+  const CIRCLE_TOKEN = process.env.CIRCLE_TOKEN || secretStore.get('CIRCLE_TOKEN') || '';
+  const syncLoop = createSyncLoop({ onedriveSync, graph, store, auditLog, corporateDiscovery, circleUrl: CIRCLE_URL, circleToken: CIRCLE_TOKEN });
   if (SYNC_INTERVAL_MS > 0) {
     syncLoop.start(SYNC_INTERVAL_MS);
     console.log(`  onedrive sync: enabled, every ${Math.round(SYNC_INTERVAL_MS / 1000)}s`);
   } else {
     console.log('  onedrive sync: disabled (set VAULT_SYNC_INTERVAL_MS to enable)');
+  }
+
+  // -- 5.6. Gmail sync loop (BM26082011) --------------------------------------
+  // Own interval, independent of the OneDrive one above -- polling Gmail on
+  // OneDrive's cadence (or vice versa) would be a coincidence, not a design
+  // choice. Defaults to 5 minutes per the row's own spec; disabled the same
+  // way the OneDrive loop is (0 = off) so the test suite's repeated main()
+  // calls don't fire real Gmail polls with no credentials configured.
+  const EMAIL_SYNC_INTERVAL_MS = parseInt(process.env.EMAIL_SYNC_INTERVAL_MS || secretStore.get('EMAIL_SYNC_INTERVAL_MS') || String(5 * 60 * 1000), 10);
+  const gmailSyncLoop = createGmailSyncLoop({ googleClients, gmail, store, auditLog });
+  if (EMAIL_SYNC_INTERVAL_MS > 0 && process.env.EMAIL_SYNC_DISABLED !== '1') {
+    gmailSyncLoop.start(EMAIL_SYNC_INTERVAL_MS);
+    console.log(`  gmail sync: enabled, every ${Math.round(EMAIL_SYNC_INTERVAL_MS / 1000)}s (${GOOGLE_ACCOUNT_LABELS.length} account label(s))`);
+  } else {
+    console.log('  gmail sync: disabled (EMAIL_SYNC_DISABLED=1 or EMAIL_SYNC_INTERVAL_MS<=0)');
   }
 
   // -- 6. FAIL CLOSED bind guard (same rule as the monolith this was extracted from) --
@@ -367,6 +418,85 @@ async function main() {
         return sendJson(res, 200, { ok: true, connected: false, waiting: true });
       }
       return sendJson(res, 200, { ok: true, connected: false, waiting: false, error: r.data?.error_description || err });
+    }
+
+    // Google device-code sign-in (BI26082005) -- same shape/contract as the
+    // Microsoft pair above, one account label at a time. `account` defaults
+    // to 'default' (the only label instantiated unless GOOGLE_ACCOUNTS names
+    // more) so an existing single-account caller doesn't need to know the
+    // multi-account plumbing exists at all.
+    if (pathname === '/google/auth/start' && req.method === 'POST') {
+      let account = 'default';
+      try { account = JSON.parse(await readBody(req) || '{}').account || 'default'; } catch {}
+      const google = googleClients.get(account);
+      if (!google) return sendJson(res, 400, { ok: false, error: `unknown Google account '${account}'` });
+      const data = await google.startDeviceCodeAuth();
+      if (!data?.device_code) return sendJson(res, 502, { ok: false, error: data?.error_description || 'could not start device code sign-in' });
+      return sendJson(res, 200, {
+        ok: true,
+        userCode: data.user_code,
+        verificationUri: data.verification_url || data.verification_uri_complete,
+        expiresInSec: data.expires_in,
+        deviceCode: data.device_code,
+        pollIntervalSec: data.interval || 5,
+      });
+    }
+    if (pathname === '/google/auth/poll' && req.method === 'POST') {
+      let account = 'default';
+      let deviceCode = '';
+      try {
+        const p = JSON.parse(await readBody(req) || '{}');
+        account = p.account || 'default';
+        deviceCode = p.deviceCode || '';
+      } catch {}
+      if (!deviceCode) return sendJson(res, 400, { ok: false, error: 'deviceCode required' });
+      const google = googleClients.get(account);
+      if (!google) return sendJson(res, 400, { ok: false, error: `unknown Google account '${account}'` });
+      const r = await google.pollDeviceCodeAuth(deviceCode);
+      if (r.success) return sendJson(res, 200, { ok: true, connected: true });
+      const err = r.data?.error || '';
+      if (err === 'authorization_pending' || err === 'slow_down') {
+        return sendJson(res, 200, { ok: true, connected: false, waiting: true });
+      }
+      return sendJson(res, 200, { ok: true, connected: false, waiting: false, error: r.data?.error_description || err });
+    }
+
+    // Send a reply/new message (BM26082011). On a successful send, also
+    // files the sent copy into scope/inbox.tsv as an outbound row -- done
+    // HERE (not by the caller) since vault already holds direct store
+    // access to that TSV, same reasoning gmail-sync.js writes inbound rows
+    // directly rather than round-tripping through another engine's route
+    // (and circle's own generic addMessage doesn't populate PERSON_ID/
+    // DIRECTION at all -- confirmed 21 Aug, logged as a fresh fix.md row
+    // rather than depended on here).
+    if (pathname === '/google/send' && req.method === 'POST') {
+      let p = {};
+      try { p = JSON.parse(await readBody(req) || '{}'); } catch {}
+      const google = googleClients.get(p.account || 'default');
+      if (!google) return sendJson(res, 400, { ok: false, error: `unknown Google account '${p.account || 'default'}'` });
+      const r = await gmail.sendMessage(google, { to: p.to, subject: p.subject, body: p.body, threadId: p.threadId, inReplyTo: p.inReplyTo });
+      if (!r.ok) return sendJson(res, 502, r);
+      try {
+        const rows = store.read('scope/inbox.tsv');
+        const nextIdNum = rows.reduce((n, row) => Math.max(n, parseInt(String(row.ID).replace(/\D/g, ''), 10) || 0), 0) + 1;
+        store.append('scope/inbox.tsv', {
+          ID: `I${String(nextIdNum).padStart(3, '0')}`,
+          TITLE: p.subject || '(no subject)', BODY: p.body || '-', STATUS: 'seen',
+          SOURCE: `gmail:${p.account || 'default'}:sent:${r.id}`,
+          CAPTURED_AT: new Date().toISOString().slice(0, 10), CHANNEL: 'gmail',
+          SENDER: '-', SUBJECT: p.subject || '-', RECEIVED_AT: new Date().toISOString().slice(0, 16),
+          TAG: '-', COMMENT: '-', PERSON_ID: p.personId || '-', DIRECTION: 'out',
+        });
+      } catch (e) {
+        auditLog.log('gmail_sent_copy_file_failed', { error: String(e.message || e).slice(0, 200) });
+      }
+      return sendJson(res, 200, r);
+    }
+    if (pathname === '/google/sync-all' && req.method === 'POST') {
+      // Manual trigger, same reasoning as /onedrive/sync-all above -- lets a
+      // caller (or a test) force one pass without waiting on the interval.
+      const results = await gmailSyncLoop.runOnce();
+      return sendJson(res, 200, { ok: true, results });
     }
 
     // Read-only OneDrive verification: compares the real remote copy of one
