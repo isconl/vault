@@ -23,6 +23,7 @@ const { createVaultStore } = require('../lib/store');
 const { createGraphClient } = require('../lib/graph');
 const { createGoogleClient } = require('../lib/google');
 const gmail = require('../lib/gmail');
+const googleCalendar = require('../lib/google-calendar');
 const { createGmailSyncLoop } = require('../lib/gmail-sync');
 const blocksModule = require('../lib/blocks');
 const onedriveSync = require('../lib/onedrive-sync');
@@ -524,6 +525,24 @@ async function main() {
       // caller (or a test) force one pass without waiting on the interval.
       const results = await gmailSyncLoop.runOnce();
       return sendJson(res, 200, { ok: true, results });
+    }
+
+    // BG26082005 Calendar half. Same account-label pattern as /google/send
+    // above -- `account` defaults to 'default'.
+    if (pathname === '/google/calendar' && req.method === 'GET') {
+      const { searchParams } = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+      const google = googleClients.get(searchParams.get('account') || 'default');
+      if (!google) return sendJson(res, 400, { ok: false, error: `unknown Google account '${searchParams.get('account') || 'default'}'` });
+      const r = await googleCalendar.listEvents(google, { timeMin: searchParams.get('timeMin'), timeMax: searchParams.get('timeMax') });
+      return sendJson(res, r.ok ? 200 : 502, r);
+    }
+    if (pathname === '/google/calendar' && req.method === 'POST') {
+      let p = {};
+      try { p = JSON.parse(await readBody(req) || '{}'); } catch {}
+      const google = googleClients.get(p.account || 'default');
+      if (!google) return sendJson(res, 400, { ok: false, error: `unknown Google account '${p.account || 'default'}'` });
+      const r = await googleCalendar.createEvent(google, { title: p.title, date: p.date, time: p.time, description: p.description, location: p.location });
+      return sendJson(res, r.ok ? 200 : 502, r);
     }
 
     // Read-only OneDrive verification: compares the real remote copy of one
