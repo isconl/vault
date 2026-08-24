@@ -24,6 +24,7 @@ const { createGraphClient } = require('../lib/graph');
 const { createGoogleClient } = require('../lib/google');
 const gmail = require('../lib/gmail');
 const googleCalendar = require('../lib/google-calendar');
+const graphMail = require('../lib/graph-mail');
 const { createGmailSyncLoop } = require('../lib/gmail-sync');
 const blocksModule = require('../lib/blocks');
 const onedriveSync = require('../lib/onedrive-sync');
@@ -534,6 +535,15 @@ async function main() {
       const google = googleClients.get(searchParams.get('account') || 'default');
       if (!google) return sendJson(res, 400, { ok: false, error: `unknown Google account '${searchParams.get('account') || 'default'}'` });
       const r = await googleCalendar.listEvents(google, { timeMin: searchParams.get('timeMin'), timeMax: searchParams.get('timeMax') });
+      return sendJson(res, r.ok ? 200 : 502, r);
+    }
+    // BI26082419: Microsoft Graph mail send (sconl@acexoft.com) -- the
+    // token already requests Mail.Send (graph.js's GRAPH_SCOPE), this is
+    // the first caller to actually exercise it.
+    if (pathname === '/graph/mail/send' && req.method === 'POST') {
+      let p = {};
+      try { p = JSON.parse(await readBody(req) || '{}'); } catch {}
+      const r = await graphMail.sendMail(graph, { to: p.to, subject: p.subject, body: p.body, cc: p.cc });
       return sendJson(res, r.ok ? 200 : 502, r);
     }
     if (pathname === '/google/calendar' && req.method === 'POST') {
