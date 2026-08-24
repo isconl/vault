@@ -633,9 +633,14 @@ async function main() {
       const result = await onedriveBrowse.upload(graph, body.folderPath || '', body.fileName, body.content || '', {
         contentBase64: body.contentBase64, contentType: body.contentType,
       });
+      // FI26082405: a non-string content/contentBase64 (an object, not a
+      // caller bug this route should trust blindly) used to throw
+      // synchronously out of Buffer.byteLength with nothing catching it,
+      // killing the whole process rather than just failing this request --
+      // String()-coerce first so a bad caller gets a normal error response.
       const bytes = body.contentBase64 !== undefined
-        ? Buffer.byteLength(body.contentBase64, 'base64')
-        : Buffer.byteLength(body.content || '', 'utf8');
+        ? Buffer.byteLength(String(body.contentBase64 || ''), 'base64')
+        : Buffer.byteLength(String(body.content || ''), 'utf8');
       if (result.ok) auditLog.log('onedrive_upload', { folderPath: body.folderPath, fileName: body.fileName, bytes });
       return sendJson(res, result.ok ? 200 : 502, result);
     }
