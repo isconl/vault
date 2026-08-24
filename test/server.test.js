@@ -291,7 +291,7 @@ test('GET /manifest lists the new google.* capabilities', async () => {
     const body = await res.json();
     const names = body.capabilities.map(c => c.name);
     assert.ok(names.includes('google.auth.start'));
-    assert.ok(names.includes('google.auth.poll'));
+    assert.ok(names.includes('google.auth.callback'));
     assert.ok(names.includes('google.send'));
     assert.ok(names.includes('google.sync.all'));
   } finally { server.close(); cleanup(); }

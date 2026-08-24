@@ -110,46 +110,50 @@ test('googleRequest() retries once on a 401 by forcing a fresh token', async () 
   assert.equal(apiCallCount, 2);
 });
 
-test('startDeviceCodeAuth() posts to oauth2.googleapis.com/device/code with the full Gmail+Calendar scope string', async () => {
-  const { client, calls } = makeClient({
-    httpsRequestFn: async () => ({ status: 200, data: { device_code: 'dc', user_code: 'ABCD-EFGH', verification_url: 'https://google.com/device', expires_in: 1800, interval: 5 } }),
-  });
-  const data = await client.startDeviceCodeAuth();
-  assert.equal(data.user_code, 'ABCD-EFGH');
-  assert.equal(calls[0].options.hostname, 'oauth2.googleapis.com');
-  assert.equal(calls[0].options.path, '/device/code');
-  const params = new URLSearchParams(calls[0].body);
-  assert.match(params.get('scope'), /gmail\.readonly/);
-  assert.match(params.get('scope'), /gmail\.send/);
-  assert.match(params.get('scope'), /calendar\.readonly/);
-  assert.match(params.get('scope'), /calendar\.events/);
+test('buildAuthUrl() returns a Google auth URL carrying PKCE challenge + the full Gmail+Calendar scope string, and stashes the verifier/state on config', () => {
+  const { client, getConfig } = makeClient();
+  const { url, state } = client.buildAuthUrl({ redirectUri: 'http://127.0.0.1:8081/google/auth/callback' });
+  const parsed = new URL(url);
+  assert.equal(parsed.hostname, 'accounts.google.com');
+  assert.match(parsed.searchParams.get('scope'), /gmail\.readonly/);
+  assert.match(parsed.searchParams.get('scope'), /gmail\.send/);
+  assert.match(parsed.searchParams.get('scope'), /calendar\.readonly/);
+  assert.match(parsed.searchParams.get('scope'), /calendar\.events/);
+  assert.equal(parsed.searchParams.get('code_challenge_method'), 'S256');
+  assert.equal(parsed.searchParams.get('state'), state);
+  assert.equal(getConfig().pendingAuth.state, state);
+  assert.ok(getConfig().pendingAuth.codeVerifier);
 });
 
-test('pollDeviceCodeAuth() persists the token and reports success once Google returns an access_token', async () => {
+test('exchangeCode() persists the token and reports success once Google returns an access_token', async () => {
   const { client, getConfig } = makeClient({
     httpsRequestFn: async () => ({ status: 200, data: { access_token: 'tok', refresh_token: 'refresh', expires_in: 3600 } }),
   });
-  const r = await client.pollDeviceCodeAuth('device-code-123');
+  const { state } = client.buildAuthUrl({ redirectUri: 'http://127.0.0.1:8081/google/auth/callback' });
+  const r = await client.exchangeCode({ code: 'auth-code-123', state });
   assert.equal(r.success, true);
   assert.equal(getConfig().accessToken, 'tok');
   assert.equal(getConfig().refreshToken, 'refresh');
+  assert.equal(getConfig().pendingAuth, null);
 });
 
-test('pollDeviceCodeAuth() reports authorization_pending as a non-success without persisting anything (Google keeps this state during normal polling)', async () => {
-  const { client, getConfig } = makeClient({
-    httpsRequestFn: async () => ({ status: 428, data: { error: 'authorization_pending' } }),
+test('exchangeCode() rejects a state that does not match the in-flight sign-in, without making a network call', async () => {
+  const { client, calls } = makeClient({
+    httpsRequestFn: async () => ({ status: 200, data: { access_token: 'tok', refresh_token: 'refresh', expires_in: 3600 } }),
   });
-  const r = await client.pollDeviceCodeAuth('device-code-123');
+  client.buildAuthUrl({ redirectUri: 'http://127.0.0.1:8081/google/auth/callback' });
+  const r = await client.exchangeCode({ code: 'auth-code-123', state: 'not-the-real-state' });
   assert.equal(r.success, false);
-  assert.equal(r.data.error, 'authorization_pending');
-  assert.equal(getConfig().accessToken, '');
+  assert.equal(r.data.error, 'state_mismatch');
+  assert.equal(calls.length, 0);
 });
 
-test('onTokenRefreshed is awaited and a persistence failure does not throw out of pollDeviceCodeAuth', async () => {
+test('onTokenRefreshed is awaited and a persistence failure does not throw out of exchangeCode', async () => {
   const { client } = makeClient({
     httpsRequestFn: async () => ({ status: 200, data: { access_token: 'tok', refresh_token: 'refresh', expires_in: 3600 } }),
     onTokenRefreshed: async () => { throw new Error('bitwarden write failed'); },
   });
-  const r = await client.pollDeviceCodeAuth('device-code-123');
+  const { state } = client.buildAuthUrl({ redirectUri: 'http://127.0.0.1:8081/google/auth/callback' });
+  const r = await client.exchangeCode({ code: 'auth-code-123', state });
   assert.equal(r.success, true);
 });

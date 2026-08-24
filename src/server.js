@@ -131,6 +131,12 @@ async function main() {
   // Engagements plan), so this defaults to one label, 'default', if unset.
   const GOOGLE_ACCOUNT_LABELS = (process.env.GOOGLE_ACCOUNTS || 'default').split(',').map(s => s.trim()).filter(Boolean);
   const googleClients = new Map();
+  // state -> account label, for the /google/auth/callback route above to
+  // resolve which googleClients entry a given redirect belongs to. Process-
+  // memory only (a sign-in in progress doesn't need to survive a restart);
+  // entries are removed as soon as the callback consumes them.
+  const pendingGoogleAuthByState = new Map();
+  const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || `http://127.0.0.1:${PORT}/google/auth/callback`;
   for (const label of GOOGLE_ACCOUNT_LABELS) {
     const secretKey = (name) => `GOOGLE_${name}__${label.toUpperCase()}`;
     let googleConfig = {
@@ -216,6 +222,36 @@ async function main() {
     }
     if (pathname === '/manifest' && req.method === 'GET') {
       return sendJson(res, 200, manifest);
+    }
+
+    // Google OAuth redirect target -- public same as the other auth routes
+    // below, and for the same reason: the browser hitting this after
+    // Google's own consent screen has no vault session yet, so it can't
+    // carry a Bearer token. Safe to leave unauthenticated: the `code` is
+    // single-use and short-lived (Google's own contract), and exchangeCode()
+    // in google.js independently checks `state` against the specific
+    // account's own in-flight pendingAuth before doing anything with it --
+    // this route just resolves which account label a given state belongs to.
+    if (pathname === '/google/auth/callback' && req.method === 'GET') {
+      const { searchParams } = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+      const state = searchParams.get('state') || '';
+      const code = searchParams.get('code') || '';
+      const oauthError = searchParams.get('error') || '';
+      const label = pendingGoogleAuthByState.get(state);
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      if (oauthError) {
+        return res.end(`<html><body>Google sign-in failed: ${oauthError}. You can close this tab.</body></html>`);
+      }
+      if (!label) {
+        return res.end('<html><body>This sign-in link has expired or was already used. Close this tab and start again.</body></html>');
+      }
+      pendingGoogleAuthByState.delete(state);
+      const google = googleClients.get(label);
+      const r = google ? await google.exchangeCode({ code, state }) : { success: false, data: { error: `unknown account '${label}'` } };
+      if (r.success) {
+        return res.end(`<html><body>Connected ${label}. You can close this tab.</body></html>`);
+      }
+      return res.end(`<html><body>Sign-in failed (${label}): ${r.data?.error_description || r.data?.error || 'unknown error'}. Close this tab and try again.</body></html>`);
     }
 
     // -- auth routes: public (they ARE the login), each with its own lockout --
@@ -431,45 +467,25 @@ async function main() {
       return sendJson(res, 200, { ok: true, connected: false, waiting: false, error: r.data?.error_description || err });
     }
 
-    // Google device-code sign-in (BI26082005) -- same shape/contract as the
-    // Microsoft pair above, one account label at a time. `account` defaults
-    // to 'default' (the only label instantiated unless GOOGLE_ACCOUNTS names
-    // more) so an existing single-account caller doesn't need to know the
-    // multi-account plumbing exists at all.
+    // Google sign-in (BI26082005) -- Authorization Code + PKCE, one account
+    // label at a time. Device-code was tried first and rejected by Google
+    // itself (see lib/google.js header) -- Gmail/Calendar scopes aren't on
+    // its allowlist, so this is a browser-visit-a-URL flow instead of a
+    // poll loop. `account` defaults to 'default' (the only label
+    // instantiated unless GOOGLE_ACCOUNTS names more) so an existing
+    // single-account caller doesn't need to know the multi-account plumbing
+    // exists at all.
     if (pathname === '/google/auth/start' && req.method === 'POST') {
       let account = 'default';
       try { account = JSON.parse(await readBody(req) || '{}').account || 'default'; } catch {}
       const google = googleClients.get(account);
       if (!google) return sendJson(res, 400, { ok: false, error: `unknown Google account '${account}'` });
-      const data = await google.startDeviceCodeAuth();
-      if (!data?.device_code) return sendJson(res, 502, { ok: false, error: data?.error_description || 'could not start device code sign-in' });
-      return sendJson(res, 200, {
-        ok: true,
-        userCode: data.user_code,
-        verificationUri: data.verification_url || data.verification_uri_complete,
-        expiresInSec: data.expires_in,
-        deviceCode: data.device_code,
-        pollIntervalSec: data.interval || 5,
-      });
-    }
-    if (pathname === '/google/auth/poll' && req.method === 'POST') {
-      let account = 'default';
-      let deviceCode = '';
-      try {
-        const p = JSON.parse(await readBody(req) || '{}');
-        account = p.account || 'default';
-        deviceCode = p.deviceCode || '';
-      } catch {}
-      if (!deviceCode) return sendJson(res, 400, { ok: false, error: 'deviceCode required' });
-      const google = googleClients.get(account);
-      if (!google) return sendJson(res, 400, { ok: false, error: `unknown Google account '${account}'` });
-      const r = await google.pollDeviceCodeAuth(deviceCode);
-      if (r.success) return sendJson(res, 200, { ok: true, connected: true });
-      const err = r.data?.error || '';
-      if (err === 'authorization_pending' || err === 'slow_down') {
-        return sendJson(res, 200, { ok: true, connected: false, waiting: true });
+      if (!(process.env.GOOGLE_CLIENT_ID || secretStore.get('GOOGLE_CLIENT_ID'))) {
+        return sendJson(res, 502, { ok: false, error: 'GOOGLE_CLIENT_ID not configured' });
       }
-      return sendJson(res, 200, { ok: true, connected: false, waiting: false, error: r.data?.error_description || err });
+      const { url, state } = google.buildAuthUrl({ redirectUri: GOOGLE_REDIRECT_URI });
+      pendingGoogleAuthByState.set(state, account);
+      return sendJson(res, 200, { ok: true, authUrl: url });
     }
 
     // Send a reply/new message (BM26082011). On a successful send, also
