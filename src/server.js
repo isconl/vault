@@ -92,6 +92,33 @@ async function main() {
     `${repairResult.emptyFilesRepaired} empty-file repair(s), ` +
     `${repairResult.rowsRestored} row(s) reconciled`);
 
+  // Corpus health check (FI26082602, 26 Aug 2026): history/onthisday.tsv is
+  // deliberately excluded from the auto-pull sync loop (sync-loop.js's
+  // SCHEMA_EXCLUDE_FROM_SYNC -- 9.4MB, doesn't change day to day), which
+  // means it has NO self-healing path if it's ever lost or reset to an
+  // empty schema stub -- unlike every other collection, which the next
+  // pull cycle repairs automatically. That's exactly what happened here:
+  // it silently sat at 0 data rows (just the header) for at least 12 days
+  // (created 17 Aug, found empty 26 Aug) with nothing surfacing it except
+  // Architect noticing the "Today in History" card never changing. A real
+  // corpus is ~26,000+ rows; anything drastically below that is either a
+  // fresh/never-migrated stub or a wipe, not a legitimately small corpus --
+  // so warn loudly on boot rather than staying silent a second time.
+  try {
+    const onThisDayRows = store.read('history/onthisday.tsv').length;
+    if (onThisDayRows < 1000) {
+      console.warn(`  WARNING: history/onthisday.tsv has only ${onThisDayRows} row(s) -- ` +
+        `expected ~26,000+. "Today in History" will silently fall back to the ` +
+        `frontend's hardcoded placeholder until this is re-populated. See ` +
+        `_legacy/memory/history/onthisday.tsv for the last known-good copy, or ` +
+        `pull the live OneDrive copy (history/onthisday.tsv), then POST ` +
+        `/onedrive/push?collection=history/onthisday.tsv to restore the remote copy too.`);
+      auditLog.log('onthisday_corpus_thin', { rows: onThisDayRows });
+    }
+  } catch (e) {
+    console.warn(`  WARNING: could not check history/onthisday.tsv row count: ${String(e.message || e)}`);
+  }
+
   // -- 4. Auth ------------------------------------------------------------------
   const auth = createAuthModule({
     getAuthToken: () => process.env.VAULT_TOKEN || process.env.ISCONL_TOKEN || secretStore.get('VAULT_TOKEN') || '',
