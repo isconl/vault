@@ -16,6 +16,7 @@
 
 const http = require('http');
 const path = require('path');
+const fs = require('fs');
 const secretStore = require('../lib/secrets');
 const { createAuditLog } = require('../lib/audit');
 const { createAuthModule, pinDigest, pinFormatOk } = require('../lib/auth');
@@ -431,6 +432,74 @@ async function main() {
         }
         return sendJson(res, 200, { ok: true, collection, bytes: body.text.length });
       }
+    }
+
+    // Freeform local profile data (name, photo URL) -- a dedicated raw JSON
+    // collection (profile/settings.json), same RAW_COLLECTIONS pattern as
+    // personal/rhythm.json, but exposed at its own path rather than the
+    // generic /vault-raw/ wrapper so a client gets parsed JSON directly
+    // instead of a {collection,text} envelope. Deliberately NOT tied to any
+    // OAuth identity -- see BL26082601's tenant-isolation decision.
+    if (pathname === '/profile' && req.method === 'GET') {
+      const text = store.rawRead('profile/settings.json');
+      let profile = {};
+      try { profile = text ? JSON.parse(text) : {}; } catch {}
+      return sendJson(res, 200, { name: profile.name || '', photoUrl: profile.photoUrl || '' });
+    }
+    if (pathname === '/profile' && req.method === 'POST') {
+      let body = {};
+      try { body = JSON.parse(await readBody(req) || '{}'); } catch {}
+      const existingText = store.rawRead('profile/settings.json');
+      let existing = {};
+      try { existing = existingText ? JSON.parse(existingText) : {}; } catch {}
+      const profile = {
+        name: String(body.name ?? existing.name ?? ''),
+        photoUrl: String(body.photoUrl ?? existing.photoUrl ?? ''),
+      };
+      store.rawWrite('profile/settings.json', JSON.stringify(profile), { force: true });
+      return sendJson(res, 200, { ok: true, ...profile });
+    }
+    // Profile photo: decode a base64-encoded image, keep it on local disk
+    // under memory/profile/ (outside store's utf8-only rawWrite, since this
+    // is binary), and hand back a URL this same server can serve back via
+    // GET /profile/photo below. OneDrive push is deliberately NOT wired here
+    // yet -- iScroll's dedicated tenant vault has no Graph/OAuth setup done
+    // for it, unlike the main fleet's vault; local-disk-only is the honest
+    // v1, follow-up to push it through onedrive-browse.js's upload() once
+    // that's set up for this tenant.
+    if (pathname === '/profile/photo' && req.method === 'POST') {
+      let body = {};
+      try { body = JSON.parse(await readBody(req) || '{}'); } catch {}
+      const ext = (String(body.filename || '').match(/\.(\w+)$/) || [, 'jpg'])[1].toLowerCase();
+      const safeExt = /^[a-z0-9]+$/.test(ext) ? ext : 'jpg';
+      let buf;
+      try { buf = Buffer.from(String(body.data || ''), 'base64'); } catch { buf = Buffer.alloc(0); }
+      if (buf.length === 0) return sendJson(res, 400, { error: 'no photo data' });
+      const dir = path.join(MEMORY_DIR, 'profile');
+      fs.mkdirSync(dir, { recursive: true });
+      const filename = `photo.${safeExt}`;
+      fs.writeFileSync(path.join(dir, filename), buf);
+      // Prefixed /api/ even though vault itself serves this at /profile/photo
+      // (no prefix) -- every real client reaches this through hub's gateway,
+      // never vault directly, so the URL handed back must be the one hub
+      // actually proxies (see api-compat.js's note on why GET bypasses the
+      // generic router).
+      const photoUrl = `/api/profile/photo?v=${Date.now()}`;
+      auditLog.log('vault_raw_written', { file: `profile/${filename}`, bytesBefore: 0, bytesAfter: buf.length });
+      return sendJson(res, 200, { ok: true, photoUrl });
+    }
+    if (pathname === '/profile/photo' && req.method === 'GET') {
+      const dir = path.join(MEMORY_DIR, 'profile');
+      let found = null;
+      try {
+        found = fs.readdirSync(dir).find((f) => /^photo\.\w+$/.test(f)) || null;
+      } catch {}
+      if (!found) return sendJson(res, 404, { error: 'no photo set' });
+      const ext = found.split('.').pop();
+      const contentType = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif' }[ext] || 'application/octet-stream';
+      const data = fs.readFileSync(path.join(dir, found));
+      res.writeHead(200, { 'Content-Type': contentType, 'Content-Length': data.length, 'Cache-Control': 'private, max-age=86400' });
+      return res.end(data);
     }
 
     // Server epoch millis -- what a client's trusted-clock sync (offset +
