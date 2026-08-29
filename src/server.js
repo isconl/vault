@@ -90,6 +90,7 @@ async function main() {
   });
   console.log(`  vault: ${repairResult.created.length} file(s) bootstrapped, ` +
     `${repairResult.columnsUpgraded} column migration(s), ` +
+    `${repairResult.columnShiftsRepaired || 0} column-shift repair(s), ` +
     `${repairResult.emptyFilesRepaired} empty-file repair(s), ` +
     `${repairResult.rowsRestored} row(s) reconciled`);
 
@@ -252,6 +253,26 @@ async function main() {
     }
     if (pathname === '/manifest' && req.method === 'GET') {
       return sendJson(res, 200, manifest);
+    }
+
+    // FI26082704 follow-up: a public, minimal readiness signal for the
+    // launch scripts (isconl-launch.sh's wait_healthy) -- /health only
+    // proves the port is bound, not that boot-time data has actually
+    // arrived, and the full /onedrive/sync-status below is (rightly)
+    // behind auth. This intentionally leaks nothing sensitive: no secret
+    // values, no file contents, just pass/fail counts and timestamps for
+    // the first sync pass, same shape a launch script needs to decide
+    // "has real data landed yet" without needing a token.
+    if (pathname === '/onedrive/sync-status/public' && req.method === 'GET') {
+      const r = syncLoop.getLastResult();
+      return sendJson(res, 200, {
+        running: syncLoop.isRunning(),
+        firstPassComplete: !!r,
+        ok: r ? r.ok.length : 0,
+        failed: r ? r.failed.length : 0,
+        startedAt: r ? r.startedAt : null,
+        finishedAt: r ? r.finishedAt : null,
+      });
     }
 
     // Google OAuth redirect target -- public same as the other auth routes
