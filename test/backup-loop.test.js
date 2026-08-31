@@ -36,6 +36,28 @@ function fakeBackupTarget({ pushOk = true, pruneOk = true } = {}) {
   };
 }
 
+test('runOnce includes the .db-salt file (hex) in push meta when present, so a restore can re-derive the encryption key', async () => {
+  const store = fakeStore();
+  fs.writeFileSync(path.join(store.memoryDir, '.db-salt'), Buffer.from('0123456789abcdef', 'hex'));
+  const backupTarget = fakeBackupTarget();
+  const loop = createBackupLoop({ store, backupTarget });
+
+  await loop.runOnce();
+
+  assert.equal(backupTarget.pushCalls[0].meta.saltHex, '0123456789abcdef');
+});
+
+test('runOnce omits saltHex from push meta when no .db-salt file exists (e.g. tsv engine), not throwing', async () => {
+  const store = fakeStore();
+  const backupTarget = fakeBackupTarget();
+  const loop = createBackupLoop({ store, backupTarget });
+
+  const result = await loop.runOnce();
+
+  assert.equal(result.ok, true);
+  assert.equal('saltHex' in backupTarget.pushCalls[0].meta, false);
+});
+
 test('runOnce snapshots the store, pushes it, prunes, and reports a successful result', async () => {
   const store = fakeStore();
   const backupTarget = fakeBackupTarget();
