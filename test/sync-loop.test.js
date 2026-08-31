@@ -39,7 +39,8 @@ function fakeAuditLog() {
 
 test('allCollections includes every schema TSV (except excluded local-only files), the extra finance TSVs, and the raw state files', () => {
   const { tsv, raw } = allCollections();
-  const excluded = ['history/onthisday.tsv', 'scope/theme_days.tsv', 'learning/audio_versions.tsv'];
+  const excluded = ['history/onthisday.tsv', 'scope/theme_days.tsv', 'learning/audio_versions.tsv', 'scope/deal_flow_parties.tsv',
+    'scope/pending_jira_writes.tsv', 'teams/teams.tsv', 'teams/members.tsv', 'teams/work.tsv'];
   for (const rel of Object.keys(defaultSchema).filter(c => !excluded.includes(c))) {
     assert.ok(tsv.includes(rel), `missing schema collection ${rel}`);
   }
@@ -136,6 +137,31 @@ test('runOnce pulls every course\'s lesson folder, using course IDs from the jus
   assert.deepEqual(onedriveSync.folderCalls, ['learning/viva', 'learning/wabba-ux']);
   assert.ok(result.ok.some((r) => r.collection === 'learning/viva'));
   assert.ok(result.ok.some((r) => r.collection === 'learning/wabba-ux'));
+});
+
+// FI26082702 follow-up (28 Aug 2026): a corrupted learning/courses.tsv had
+// every one of its 27 rows reading ID "-" (a column-shift bug, not fixed
+// here -- see FI26082801), which used to fire 27 identical, guaranteed-404
+// `pullFolder(graph, store, 'learning/-')` calls every pass, padding the
+// "N collection(s) failed" count with noise unconnected to any real sync
+// problem.
+test('course IDs that are the "-" placeholder are skipped, not pulled as literal folders', async () => {
+  const onedriveSync = fakeOnedriveSync();
+  const store = fakeStoreWithCourses(['viva', '-', '-', 'wabba-ux', '-']);
+  const loop = createSyncLoop({ onedriveSync, graph: {}, store, delayMs: 0 });
+  const result = await loop.runOnce();
+
+  assert.deepEqual(onedriveSync.folderCalls, ['learning/viva', 'learning/wabba-ux']);
+  assert.ok(!result.failed.some((f) => f.collection === 'learning/-'));
+});
+
+test('duplicate course IDs are pulled once, not once per row', async () => {
+  const onedriveSync = fakeOnedriveSync();
+  const store = fakeStoreWithCourses(['viva', 'viva', 'wabba-ux']);
+  const loop = createSyncLoop({ onedriveSync, graph: {}, store, delayMs: 0 });
+  await loop.runOnce();
+
+  assert.deepEqual(onedriveSync.folderCalls, ['learning/viva', 'learning/wabba-ux']);
 });
 
 test('a course whose folder pull fails does not block the rest of the pass or the other courses', async () => {

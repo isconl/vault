@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { checkRemote, fetchRemoteText, pullToLocal, listRemoteFolder, pullFolder, pushToRemote, REMOTE_ROOT } = require('../lib/onedrive-sync');
+const { checkRemote, fetchRemoteText, pullToLocal, pullToLocalRaw, listRemoteFolder, pullFolder, pushToRemote, REMOTE_ROOT } = require('../lib/onedrive-sync');
 const { createVaultStore } = require('../lib/store');
 
 function fakeGraph(response) {
@@ -254,4 +254,83 @@ test('pushToRemote reports a non-2xx Graph response as ok:false, never throws', 
   const result = await pushToRemote(graph, store, 'scope/tasks.tsv');
   assert.equal(result.ok, false);
   assert.equal(result.status, 401);
+});
+
+// FI26082702: reproduced live twice (26-27 Aug 2026) -- a local edit made
+// between two pull ticks was silently overwritten by the next automatic
+// pull, since pullToLocal/pullToLocalRaw had no concept of "local changed
+// since we last knew we were in sync." These tests reproduce the race
+// directly: pull once (establishes a known-good sync point), edit locally
+// (bumps the file's mtime past that point), then pull again and confirm
+// the edit survives instead of being clobbered.
+
+test('pullToLocal skips an overwrite when the local file was edited after the last known-good sync', async () => {
+  const store = tmpStore();
+  store.ensureVault();
+  const graph = fakeGraph({ status: 200, data: 'ID\tTITLE\tSTATUS\n1\tBuy milk\topen\n' });
+  await pullToLocal(graph, store, 'scope/tasks.tsv'); // establishes the sync point
+
+  // A real gap, not just the next statement -- otherwise this could land
+  // inside SYNC_POINT_GRACE_MS's few-ms window meant only to absorb mtime's
+  // sub-millisecond precision against Date.now()'s truncation, same as any
+  // real local edit is naturally seconds (not milliseconds) after a sync.
+  await new Promise((r) => setTimeout(r, 20));
+  // Simulate a local edit landing after the pull (e.g. a session hand-editing
+  // the TSV) -- append() rewrites the file, which bumps its mtime.
+  store.append('scope/tasks.tsv', { ID: '2', TITLE: 'Local-only edit', STATUS: 'open' });
+
+  const result = await pullToLocal(graph, store, 'scope/tasks.tsv');
+  assert.equal(result.ok, true, 'a guarded skip is not a failure');
+  assert.equal(result.skipped, 'local-newer');
+  const rows = store.read('scope/tasks.tsv');
+  assert.equal(rows.length, 2, 'the local-only edit must survive the pull, not be overwritten');
+  assert.ok(rows.some(r => r.TITLE === 'Local-only edit'));
+});
+
+test('pullToLocal force:true bypasses the local-newer guard, same as the massacre guard', async () => {
+  const store = tmpStore();
+  store.ensureVault();
+  const graph = fakeGraph({ status: 200, data: 'ID\tTITLE\tSTATUS\n1\tBuy milk\topen\n' });
+  await pullToLocal(graph, store, 'scope/tasks.tsv');
+  store.append('scope/tasks.tsv', { ID: '2', TITLE: 'Local-only edit', STATUS: 'open' });
+
+  const result = await pullToLocal(graph, store, 'scope/tasks.tsv', { force: true });
+  assert.equal(result.skipped, undefined);
+  const rows = store.read('scope/tasks.tsv');
+  assert.equal(rows.length, 1, 'force:true pulled remote through, overwriting the local edit as requested');
+});
+
+test('pullToLocal proceeds normally on a first-ever pull (no known-good baseline yet)', async () => {
+  const store = tmpStore();
+  store.ensureVault();
+  const graph = fakeGraph({ status: 200, data: 'ID\tTITLE\tSTATUS\n1\tBuy milk\topen\n' });
+  const result = await pullToLocal(graph, store, 'scope/tasks.tsv');
+  assert.equal(result.skipped, undefined);
+  assert.equal(store.read('scope/tasks.tsv').length, 1);
+});
+
+test('a push establishes a sync point too, so the next pull is not needlessly skipped', async () => {
+  const store = tmpStore();
+  store.ensureVault();
+  store.append('scope/tasks.tsv', { ID: '1', TITLE: 'Buy milk', STATUS: 'open' });
+  const pushGraph = fakeGraph({ status: 200, data: {} });
+  await pushToRemote(pushGraph, store, 'scope/tasks.tsv');
+
+  const pullGraph = fakeGraph({ status: 200, data: 'ID\tTITLE\tSTATUS\n1\tBuy milk\topen\n' });
+  const result = await pullToLocal(pullGraph, store, 'scope/tasks.tsv');
+  assert.equal(result.skipped, undefined, 'a push counts as a known-good sync point, so this pull should proceed normally');
+});
+
+test('pullToLocalRaw skips an overwrite when the local file was edited after the last known-good sync', async () => {
+  const store = tmpStore();
+  const graph = fakeGraph({ status: 200, data: '{"a":1}' });
+  await pullToLocalRaw(graph, store, 'scope/state.json'); // establishes the sync point
+
+  await new Promise((r) => setTimeout(r, 20)); // see the matching comment in the pullToLocal version of this test
+  store.rawWrite('scope/state.json', '{"a":1,"b":"local edit"}');
+
+  const result = await pullToLocalRaw(graph, store, 'scope/state.json');
+  assert.equal(result.ok, true, 'a guarded skip is not a failure');
+  assert.equal(result.skipped, 'local-newer');
+  assert.equal(store.rawRead('scope/state.json'), '{"a":1,"b":"local edit"}', 'the local-only edit must survive the pull, not be overwritten');
 });

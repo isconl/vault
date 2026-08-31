@@ -44,6 +44,13 @@ async function startServer(envOverrides = {}) {
     // Gmail sync loop -- explicit off in tests, not left to its 5-minute
     // default.
     EMAIL_SYNC_DISABLED: '1',
+    // Explicit empty override, not absent: get()'s hasOwnProperty check
+    // treats this as authoritative and never falls through to a real
+    // GOOGLE_CLIENT_ID sitting in this machine's own environment or
+    // Bitwarden config (FI26082703: "POST /google/auth/start...fails soft
+    // (502)" assumes no real client_id is configured, which isn't actually
+    // guaranteed without this -- same isolation gap as FI26082701 in hub).
+    GOOGLE_CLIENT_ID: '',
     ...envOverrides,
   });
   delete require.cache[require.resolve('../src/server')];
@@ -74,6 +81,35 @@ test('GET /manifest lists vault\'s capabilities without auth', async () => {
     assert.equal(body.engine, 'vault');
     assert.ok(body.capabilities.some(c => c.name === 'vault.read'));
     assert.ok(body.capabilities.some(c => c.name === 'auth.totp'));
+  } finally { server.close(); cleanup(); }
+});
+
+test('GET /onedrive/sync-status/public reports readiness without auth, before any sync pass has run', async () => {
+  const { server, port, cleanup } = await startServer(); // VAULT_SYNC_INTERVAL_MS: '0' in startServer's own env -- the loop never fires
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/onedrive/sync-status/public`);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.firstPassComplete, false);
+    assert.equal(body.ok, 0);
+    assert.equal(body.failed, 0);
+  } finally { server.close(); cleanup(); }
+});
+
+test('GET /onedrive/sync-status/public reports ok/failed counts and completion after a sync pass, without needing auth', async () => {
+  const { server, port, cleanup } = await startServer();
+  try {
+    // Force a pass via the authenticated on-demand route so the public one
+    // has a real lastResult to report -- proves the two share state.
+    await fetch(`http://127.0.0.1:${port}/onedrive/sync-all`, {
+      method: 'POST', headers: { Authorization: 'Bearer test-static-token' },
+    });
+    const res = await fetch(`http://127.0.0.1:${port}/onedrive/sync-status/public`);
+    const body = await res.json();
+    assert.equal(body.firstPassComplete, true);
+    assert.equal(typeof body.ok, 'number');
+    assert.equal(typeof body.failed, 'number');
+    assert.ok(body.finishedAt);
   } finally { server.close(); cleanup(); }
 });
 
