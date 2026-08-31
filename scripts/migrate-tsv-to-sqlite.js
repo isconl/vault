@@ -28,7 +28,7 @@ const path = require('path');
 const { createVaultStore } = require('../lib/store');
 const { createSqliteStore } = require('../lib/sqlite-store');
 const defaultSchema = require('../lib/default-schema');
-const { EXTRA_FINANCE_TSV, RAW_COLLECTIONS } = require('../lib/sync-loop');
+const { EXTRA_FINANCE_TSV, RAW_COLLECTIONS } = require('../lib/collection-registry');
 const secretStore = require('../lib/secrets');
 
 const DRY_RUN = process.argv.includes('--dry-run');

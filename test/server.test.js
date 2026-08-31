@@ -35,12 +35,13 @@ async function startServer(envOverrides = {}) {
     VAULT_SESSION_FILE: sessionFile,
     VAULT_TOKEN: 'test-static-token',
     BWS_ACCESS_TOKEN: '',   // no Bitwarden in tests -- secrets.init() must degrade gracefully, not hang/throw
-    // Explicit, not just absent: the sync loop now also falls back to a
-    // Bitwarden secret (VAULT_SYNC_INTERVAL_MS) for portability, so on a
+    // Explicit, not just absent: the backup loop now also falls back to a
+    // Bitwarden secret (VAULT_BACKUP_INTERVAL_MS) for portability, so on a
     // machine that DOES have real Bitwarden creds in its ambient env this
-    // would otherwise fire real Graph calls during every test run.
-    VAULT_SYNC_INTERVAL_MS: '0',
-    // Same reasoning as VAULT_SYNC_INTERVAL_MS above, for BM26082011's
+    // would otherwise fire a real boot-time backup pass during every test
+    // run using the sqlite engine (BI26083005 -- was VAULT_SYNC_INTERVAL_MS).
+    VAULT_BACKUP_INTERVAL_MS: '0',
+    // Same reasoning as VAULT_BACKUP_INTERVAL_MS above, for BM26082011's
     // Gmail sync loop -- explicit off in tests, not left to its 5-minute
     // default.
     EMAIL_SYNC_DISABLED: '1',
@@ -84,31 +85,31 @@ test('GET /manifest lists vault\'s capabilities without auth', async () => {
   } finally { server.close(); cleanup(); }
 });
 
-test('GET /onedrive/sync-status/public reports readiness without auth, before any sync pass has run', async () => {
-  const { server, port, cleanup } = await startServer(); // VAULT_SYNC_INTERVAL_MS: '0' in startServer's own env -- the loop never fires
+test('GET /backup/status/public reports readiness without auth, before any backup pass has run', async () => {
+  const { server, port, cleanup } = await startServer(); // VAULT_BACKUP_INTERVAL_MS: '0' in startServer's own env -- the loop never fires
   try {
-    const res = await fetch(`http://127.0.0.1:${port}/onedrive/sync-status/public`);
+    const res = await fetch(`http://127.0.0.1:${port}/backup/status/public`);
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.equal(body.firstPassComplete, false);
-    assert.equal(body.ok, 0);
-    assert.equal(body.failed, 0);
+    assert.equal(body.ok, false);
   } finally { server.close(); cleanup(); }
 });
 
-test('GET /onedrive/sync-status/public reports ok/failed counts and completion after a sync pass, without needing auth', async () => {
-  const { server, port, cleanup } = await startServer();
+test('GET /backup/status/public reports completion and result shape after a backup pass, without needing auth', async () => {
+  // sqlite engine so store.snapshotToFile exists -- no real Bitwarden/Graph
+  // creds in this test env, so the push itself fails (502-shaped), but
+  // that's still a real completed pass with a real result to report;
+  // proves /backup/run and /backup/status/public share state either way.
+  const { server, port, cleanup } = await startServer({ VAULT_STORE_ENGINE: 'sqlite', VAULT_DB_KEY_PASSPHRASE: 'test-fixture-passphrase' });
   try {
-    // Force a pass via the authenticated on-demand route so the public one
-    // has a real lastResult to report -- proves the two share state.
-    await fetch(`http://127.0.0.1:${port}/onedrive/sync-all`, {
+    await fetch(`http://127.0.0.1:${port}/backup/run`, {
       method: 'POST', headers: { Authorization: 'Bearer test-static-token' },
     });
-    const res = await fetch(`http://127.0.0.1:${port}/onedrive/sync-status/public`);
+    const res = await fetch(`http://127.0.0.1:${port}/backup/status/public`);
     const body = await res.json();
     assert.equal(body.firstPassComplete, true);
-    assert.equal(typeof body.ok, 'number');
-    assert.equal(typeof body.failed, 'number');
+    assert.equal(typeof body.ok, 'boolean');
     assert.ok(body.finishedAt);
   } finally { server.close(); cleanup(); }
 });

@@ -29,11 +29,11 @@ const googleCalendar = require('../lib/google-calendar');
 const graphMail = require('../lib/graph-mail');
 const { createGmailSyncLoop } = require('../lib/gmail-sync');
 const blocksModule = require('../lib/blocks');
-const onedriveSync = require('../lib/onedrive-sync');
 const onedriveBrowse = require('../lib/onedrive-browse');
 const { onThisDay } = require('../lib/onthisday');
 const narration = require('../lib/narration');
-const { createSyncLoop } = require('../lib/sync-loop');
+const { createBackupLoop } = require('../lib/backup-loop');
+const { createOneDriveBackupTarget } = require('../lib/backup/onedrive-target');
 const corporateDiscovery = require('../lib/corporate-discovery');
 const manifest = require('../lib/manifest');
 
@@ -129,9 +129,10 @@ async function main() {
       console.warn(`  WARNING: history/onthisday.tsv has only ${onThisDayRows} row(s) -- ` +
         `expected ~26,000+. "Today in History" will silently fall back to the ` +
         `frontend's hardcoded placeholder until this is re-populated. See ` +
-        `_legacy/memory/history/onthisday.tsv for the last known-good copy, or ` +
-        `pull the live OneDrive copy (history/onthisday.tsv), then POST ` +
-        `/onedrive/push?collection=history/onthisday.tsv to restore the remote copy too.`);
+        `_legacy/memory/history/onthisday.tsv for the last known-good copy to ` +
+        `restore from directly (BI26083005: OneDrive is backup-only now, no ` +
+        `more per-collection pull/push -- the next backup pass picks up the ` +
+        `restored rows automatically).`);
       auditLog.log('onthisday_corpus_thin', { rows: onThisDayRows });
     }
   } catch (e) {
@@ -206,34 +207,66 @@ async function main() {
     }));
   }
 
-  // Write-then-push (SYNC1, 2026-08-18): every local vault write now also
-  // pushes that same file up to OneDrive, fire-and-forget, so a local edit
-  // outside the pull loop survives the next scheduled pull instead of being
-  // silently overwritten by it. Wired here (not at store creation, above)
-  // because it needs a live graph client. Safe with sync disabled too --
-  // pushToRemote just fails closed (401) the same as any other Graph call
-  // when there's no token, and firePush only logs that, never throws.
-  store.setPushHook((relPath) => onedriveSync.pushToRemote(graph, store, relPath));
+  // BI26083005: SYNC1's write-then-push hook is retired along with the
+  // pull-based sync loop it protected against -- there is no more per-write
+  // push to reconcile with a scheduled pull, since there is no more
+  // scheduled pull. A write is durable the instant it's written (same as
+  // always); OneDrive now only ever receives whole-DB backup snapshots on
+  // the backup loop's own interval (below), never a live per-collection
+  // write-through.
 
-  // -- 5.5. OneDrive sync loop (boot-time pull + interval repeat) -------------
-  // Off by default -- the test suite calls main() repeatedly with no real
-  // Graph credentials configured, and an enabled-by-default loop would fire
-  // ~35 real HTTPS calls per test. Explicit opt-in matches the fail-closed
-  // pattern the rest of this file already uses for auth. Falls back to a
-  // Bitwarden secret (not just the env var) so this survives a fresh clone
-  // on ANY machine/deploy path -- dev-local.sh and docker-compose.yml both
-  // set the env var already, but Render's per-service env isn't in this
-  // repo at all, and Bitwarden is the one config source every deployment
-  // path already depends on (see _handoff/migration-log.md, 2026-08-14).
-  const SYNC_INTERVAL_MS = parseInt(process.env.VAULT_SYNC_INTERVAL_MS || secretStore.get('VAULT_SYNC_INTERVAL_MS') || '0', 10);
+  // -- 5.5. Backup loop (encrypted whole-DB snapshot -> OneDrive, on an
+  // interval; local-to-remote only, one-directional, no pull ever) --------
+  // Off by default for the same reason the old sync loop was: the test
+  // suite calls main() repeatedly with no real Graph credentials
+  // configured, and an enabled-by-default loop would fire real HTTPS calls
+  // per test. Falls back to a Bitwarden secret (not just the env var), same
+  // as the old VAULT_SYNC_INTERVAL_MS did, so this survives a fresh clone
+  // on any deploy path. Default 30 minutes (1800000ms) when explicitly
+  // enabled with no value -- a deliberate, visible choice distinct from the
+  // old pull loop's 900s tuning (that number was about pull freshness; this
+  // one is about acceptable backup recovery-point-objective), not silently
+  // inherited. Only meaningful on the sqlite engine (needs
+  // store.snapshotToFile) -- skipped with a clear log line on 'tsv'.
+  const VAULT_BACKUP_INTERVAL_MS = parseInt(process.env.VAULT_BACKUP_INTERVAL_MS || secretStore.get('VAULT_BACKUP_INTERVAL_MS') || String(30 * 60 * 1000), 10);
+  const backupTarget = createOneDriveBackupTarget({ graph });
+  const backupLoop = createBackupLoop({ store, backupTarget, auditLog });
+  if (VAULT_STORE_ENGINE !== 'sqlite') {
+    console.log(`  vault backup: disabled (VAULT_STORE_ENGINE=${VAULT_STORE_ENGINE}, backups need the sqlite engine)`);
+  } else if (VAULT_BACKUP_INTERVAL_MS > 0) {
+    backupLoop.start(VAULT_BACKUP_INTERVAL_MS);
+    console.log(`  vault backup: enabled, every ${Math.round(VAULT_BACKUP_INTERVAL_MS / 1000)}s`);
+  } else {
+    console.log('  vault backup: disabled (set VAULT_BACKUP_INTERVAL_MS to enable)');
+  }
+
+  // Corporate engagement org discovery (BC26082006) -- previously piggybacked
+  // on the old sync loop's per-pass results; now runs on its own small
+  // interval, decoupled from vault backup entirely (discovery reads a
+  // OneDrive folder listing, unrelated to vault's own data). Skipped
+  // (not failed) when CIRCLE_URL isn't configured, same fail-soft posture
+  // as before.
   const CIRCLE_URL = process.env.CIRCLE_URL || '';
   const CIRCLE_TOKEN = process.env.CIRCLE_TOKEN || secretStore.get('CIRCLE_TOKEN') || '';
-  const syncLoop = createSyncLoop({ onedriveSync, graph, store, auditLog, corporateDiscovery, circleUrl: CIRCLE_URL, circleToken: CIRCLE_TOKEN });
-  if (SYNC_INTERVAL_MS > 0) {
-    syncLoop.start(SYNC_INTERVAL_MS);
-    console.log(`  onedrive sync: enabled, every ${Math.round(SYNC_INTERVAL_MS / 1000)}s`);
+  const CORPORATE_DISCOVERY_INTERVAL_MS = parseInt(process.env.CORPORATE_DISCOVERY_INTERVAL_MS || String(30 * 60 * 1000), 10);
+  let corporateDiscoveryTimer = null;
+  async function runCorporateDiscovery() {
+    try {
+      const found = await corporateDiscovery.discoverOrgs(graph);
+      if (!found.ok) { auditLog.log('corporate_discovery_failed', { error: found.error }); return; }
+      const pushed = await corporateDiscovery.pushDiscoveredOrgs(found.orgs, { circleUrl: CIRCLE_URL, token: CIRCLE_TOKEN });
+      auditLog.log('corporate_discovery_pass', { ok: pushed.ok, orgsSeen: found.orgs.length, created: pushed.created, error: pushed.error });
+    } catch (e) {
+      auditLog.log('corporate_discovery_failed', { error: String(e.message || e).slice(0, 200) });
+    }
+  }
+  if (CIRCLE_URL) {
+    runCorporateDiscovery();
+    corporateDiscoveryTimer = setInterval(runCorporateDiscovery, CORPORATE_DISCOVERY_INTERVAL_MS);
+    if (corporateDiscoveryTimer.unref) corporateDiscoveryTimer.unref();
+    console.log(`  corporate discovery: enabled, every ${Math.round(CORPORATE_DISCOVERY_INTERVAL_MS / 1000)}s`);
   } else {
-    console.log('  onedrive sync: disabled (set VAULT_SYNC_INTERVAL_MS to enable)');
+    console.log('  corporate discovery: disabled (set CIRCLE_URL to enable)');
   }
 
   // -- 5.6. Gmail sync loop (BM26082011) --------------------------------------
@@ -272,21 +305,16 @@ async function main() {
       return sendJson(res, 200, manifest);
     }
 
-    // FI26082704 follow-up: a public, minimal readiness signal for the
-    // launch scripts (isconl-launch.sh's wait_healthy) -- /health only
-    // proves the port is bound, not that boot-time data has actually
-    // arrived, and the full /onedrive/sync-status below is (rightly)
-    // behind auth. This intentionally leaks nothing sensitive: no secret
-    // values, no file contents, just pass/fail counts and timestamps for
-    // the first sync pass, same shape a launch script needs to decide
-    // "has real data landed yet" without needing a token.
-    if (pathname === '/onedrive/sync-status/public' && req.method === 'GET') {
-      const r = syncLoop.getLastResult();
+    // BI26083005: replaces /onedrive/sync-status/public -- same purpose
+    // (launch scripts' wait_healthy, no auth, no secrets/file contents) for
+    // the backup loop instead of the retired pull loop.
+    if (pathname === '/backup/status/public' && req.method === 'GET') {
+      const r = backupLoop.getLastResult();
       return sendJson(res, 200, {
-        running: syncLoop.isRunning(),
+        running: backupLoop.isRunning(),
         firstPassComplete: !!r,
-        ok: r ? r.ok.length : 0,
-        failed: r ? r.failed.length : 0,
+        ok: r ? !!r.ok : false,
+        error: r ? r.error : null,
         startedAt: r ? r.startedAt : null,
         finishedAt: r ? r.finishedAt : null,
       });
@@ -437,15 +465,58 @@ async function main() {
       return sendJson(res, 200, result);
     }
 
-    // On-demand full sync pass (every known collection), independent of the
-    // interval timer -- for verifying the loop works, or forcing a refresh
-    // without waiting for VAULT_SYNC_INTERVAL_MS to elapse.
-    if (pathname === '/onedrive/sync-all' && req.method === 'POST') {
-      const result = await syncLoop.runOnce();
+    // BI26083005: replaces /onedrive/sync-all -- force an immediate backup
+    // pass without waiting for VAULT_BACKUP_INTERVAL_MS to elapse.
+    if (pathname === '/backup/run' && req.method === 'POST') {
+      const result = await backupLoop.runOnce();
       return sendJson(res, 200, result);
     }
-    if (pathname === '/onedrive/sync-status' && req.method === 'GET') {
-      return sendJson(res, 200, { running: syncLoop.isRunning(), lastResult: syncLoop.getLastResult() });
+    if (pathname === '/backup/status' && req.method === 'GET') {
+      return sendJson(res, 200, { running: backupLoop.isRunning(), lastResult: backupLoop.getLastResult() });
+    }
+    if (pathname === '/backup/list' && req.method === 'GET') {
+      const result = await backupTarget.list();
+      return sendJson(res, result.ok ? 200 : 502, result);
+    }
+    // The single most dangerous route in the system: overwrites the live
+    // vault.db with a chosen (or most-recent) backup generation. Requires
+    // an explicit {confirm:true} -- never triggered automatically by
+    // anything in this codebase; the only caller is a human operator or an
+    // explicit script. Always keeps the CURRENT live vault.db in .trash
+    // first (same previous-version-kept discipline as every other write in
+    // this codebase, hand-rolled here since this is a whole-file operation,
+    // not a collection-scoped one), and logs full detail to the audit log.
+    if (pathname === '/backup/restore' && req.method === 'POST') {
+      const body = JSON.parse((await readBody(req)) || '{}');
+      if (body.confirm !== true) return sendJson(res, 400, { ok: false, error: 'restore requires {confirm:true} in the request body' });
+      if (VAULT_STORE_ENGINE !== 'sqlite') return sendJson(res, 400, { ok: false, error: 'restore is only meaningful on the sqlite engine' });
+
+      const ref = body.ref; // omit for "most recent"
+      let targetRef = ref;
+      if (!targetRef) {
+        const listResult = await backupTarget.list();
+        if (!listResult.ok || !listResult.generations.length) return sendJson(res, 502, { ok: false, error: 'no generations available to restore' });
+        targetRef = listResult.generations[0].ref;
+      }
+
+      const tmpPath = path.join(store.memoryDir, '.backup-tmp', `restore-${Date.now()}.db`);
+      fs.mkdirSync(path.dirname(tmpPath), { recursive: true });
+      const fetchResult = await backupTarget.fetch(targetRef, tmpPath);
+      if (!fetchResult.ok) {
+        try { fs.rmSync(tmpPath, { force: true }); } catch {}
+        return sendJson(res, 502, fetchResult);
+      }
+
+      const liveDbPath = path.join(store.memoryDir, 'vault.db');
+      const day = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+      const stamp = new Date().toISOString().slice(11, 19).replace(/:/g, '');
+      const preRestoreCopyPath = path.join(store.memoryDir, '.trash', day, `vault.db.${stamp}.pre-restore`);
+      fs.mkdirSync(path.dirname(preRestoreCopyPath), { recursive: true });
+      if (fs.existsSync(liveDbPath)) fs.copyFileSync(liveDbPath, preRestoreCopyPath);
+
+      fs.renameSync(tmpPath, liveDbPath);
+      auditLog.log('vault_backup_restored', { ref: targetRef, preRestoreCopy: preRestoreCopyPath, actor: req.headers['x-actor'] || 'unknown' });
+      return sendJson(res, 200, { ok: true, ref: targetRef, preRestoreCopy: preRestoreCopyPath, note: 'restart vault to load the restored database' });
     }
 
     // Same shape as /vault/:collection above, for the non-TSV state files
@@ -689,51 +760,6 @@ async function main() {
       return sendJson(res, r.ok ? 200 : 502, r);
     }
 
-    // Read-only OneDrive verification: compares the real remote copy of one
-    // collection against the local vault, changes nothing on either side.
-    // Deliberately GET-only tonight -- see lib/onedrive-sync.js's header for
-    // why the write path isn't here yet.
-    if (pathname === '/onedrive/check' && req.method === 'GET') {
-      const { searchParams } = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-      const collection = searchParams.get('collection');
-      if (!collection) return sendJson(res, 400, { error: 'collection query param required, e.g. scope/tasks.tsv' });
-      const result = onedriveSync.isTSV(collection)
-        ? await onedriveSync.checkRemote(graph, collection, store.read(collection))
-        : await onedriveSync.checkRemoteRaw(graph, collection, store.rawRead(collection));
-      return sendJson(res, result.ok ? 200 : 502, result);
-    }
-
-    // Pulls one collection's real OneDrive content into the local vault,
-    // replacing whatever's there. Local-disk write only -- never writes
-    // back to OneDrive itself (see lib/onedrive-sync.js's header).
-    if (pathname === '/onedrive/pull' && req.method === 'POST') {
-      const { searchParams } = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-      const collection = searchParams.get('collection');
-      if (!collection) return sendJson(res, 400, { error: 'collection query param required, e.g. scope/tasks.tsv' });
-      let body = {};
-      try { body = JSON.parse(await readBody(req) || '{}'); } catch {}
-      const isTSV = onedriveSync.isTSV(collection);
-      const result = isTSV
-        ? await onedriveSync.pullToLocal(graph, store, collection, { force: !!body.force })
-        : await onedriveSync.pullToLocalRaw(graph, store, collection, { force: !!body.force });
-      if (result.ok) auditLog.log('onedrive_pulled', { collection, rows: isTSV ? result.remoteRowCount : undefined, bytes: result.remoteBytes });
-      return sendJson(res, result.ok ? 200 : 502, result);
-    }
-
-    // Manually push one collection's current local content up to OneDrive
-    // now, rather than waiting for the next local write to trigger it via
-    // store.js's push hook -- for backfilling a file that was edited before
-    // this existed (BR1/ID1's blocks.tsv/spaces.tsv renames) or force-pushing
-    // after resolving a conflict.
-    if (pathname === '/onedrive/push' && req.method === 'POST') {
-      const { searchParams } = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-      const collection = searchParams.get('collection');
-      if (!collection) return sendJson(res, 400, { error: 'collection query param required, e.g. scope/tasks.tsv' });
-      const result = await onedriveSync.pushToRemote(graph, store, collection);
-      if (result.ok) auditLog.log('onedrive_pushed', { collection, bytes: result.bytes });
-      return sendJson(res, result.ok ? 200 : 502, result);
-    }
-
     // Lists the files inside one LOCAL vault folder (not OneDrive) -- for
     // another engine to discover filenames it doesn't know in advance (a
     // course's lesson .md files) before fetching each via /vault-raw/.
@@ -742,19 +768,10 @@ async function main() {
       return sendJson(res, 200, { path: relPath, files: store.listDir(relPath) });
     }
 
-    // Pulls every file in one remote OneDrive folder into the local vault --
-    // for content whose filenames aren't fixed in advance (a course's lesson
-    // .md files), unlike /onedrive/pull's single known collection path.
-    if (pathname === '/onedrive/pull-folder' && req.method === 'POST') {
-      const { searchParams } = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-      const folder = searchParams.get('path');
-      if (!folder) return sendJson(res, 400, { error: 'path query param required, e.g. learning/viva' });
-      let body = {};
-      try { body = JSON.parse(await readBody(req) || '{}'); } catch {}
-      const result = await onedriveSync.pullFolder(graph, store, folder, { force: !!body.force });
-      if (result.ok) auditLog.log('onedrive_folder_pulled', { folder, files: result.files.length });
-      return sendJson(res, result.ok ? 200 : 502, result);
-    }
+    // BI26083005 retired /onedrive/check, /onedrive/pull, /onedrive/push,
+    // /onedrive/pull-folder along with onedrive-sync.js itself -- OneDrive
+    // is backup-only now (/backup/* above), never live-read or
+    // per-collection pushed/pulled.
 
     // -- OneDrive file manager: general-purpose browse/CRUD anywhere in the
     // connected drive, distinct from the known-collection sync routes above.
@@ -959,7 +976,7 @@ async function main() {
     server.listen(PORT, BIND, () => {
       const actualPort = server.address().port;
       console.log(`  vault listening on ${BIND}:${actualPort}`);
-      resolve({ server, store, auth, graph, auditLog, secretStore, syncLoop, port: actualPort });
+      resolve({ server, store, auth, graph, auditLog, secretStore, backupLoop, port: actualPort });
     });
   });
 }
