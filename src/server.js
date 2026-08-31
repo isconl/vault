@@ -21,6 +21,7 @@ const secretStore = require('../lib/secrets');
 const { createAuditLog } = require('../lib/audit');
 const { createAuthModule, pinDigest, pinFormatOk } = require('../lib/auth');
 const { createVaultStore } = require('../lib/store');
+const { createSqliteStore } = require('../lib/sqlite-store');
 const { createGraphClient } = require('../lib/graph');
 const { createGoogleClient } = require('../lib/google');
 const gmail = require('../lib/gmail');
@@ -41,6 +42,11 @@ const BIND = process.env.VAULT_BIND || '127.0.0.1';
 const MEMORY_DIR = process.env.VAULT_MEMORY_DIR || path.join(__dirname, '..', 'memory');
 const LOGS_DIR = process.env.VAULT_LOGS_DIR || path.join(__dirname, '..', 'runtime', 'logs');
 const SESSION_FILE = process.env.VAULT_SESSION_FILE || path.join(__dirname, '..', 'runtime', 'sessions.json');
+// BI26083003: which storage engine backs the vault. Defaults to the
+// battle-tested TSV engine -- 'sqlite' is an explicit, deliberate opt-in,
+// never silently inherited. See vault/scripts/migrate-tsv-to-sqlite.js for
+// the one-time migration this flag assumes has already been run.
+const VAULT_STORE_ENGINE = process.env.VAULT_STORE_ENGINE || 'tsv';
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -76,7 +82,17 @@ async function main() {
   const auditLog = createAuditLog({ logsDir: LOGS_DIR });
 
   // -- 3. Vault store: bootstrap + self-repair BEFORE serving any request ----
-  const store = createVaultStore({ memoryDir: MEMORY_DIR, logsDir: LOGS_DIR, auditLog });
+  let store;
+  if (VAULT_STORE_ENGINE === 'sqlite') {
+    const dbKeyPassphrase = secretStore.get('VAULT_DB_KEY_PASSPHRASE');
+    if (!dbKeyPassphrase) throw new Error("VAULT_STORE_ENGINE=sqlite but VAULT_DB_KEY_PASSPHRASE is not resolvable -- run BI26083002's provisioning step first");
+    store = createSqliteStore({ memoryDir: MEMORY_DIR, logsDir: LOGS_DIR, auditLog, dbKeyPassphrase });
+  } else if (VAULT_STORE_ENGINE === 'tsv') {
+    store = createVaultStore({ memoryDir: MEMORY_DIR, logsDir: LOGS_DIR, auditLog });
+  } else {
+    throw new Error(`VAULT_STORE_ENGINE must be 'tsv' or 'sqlite', got ${JSON.stringify(VAULT_STORE_ENGINE)}`);
+  }
+  console.log(`  store engine: ${VAULT_STORE_ENGINE}`);
   const repairResult = store.bootRepair();
 
   // Day-scheduling engine (ported from isconl-agent's lib/blocks.js, dev
@@ -91,8 +107,9 @@ async function main() {
   console.log(`  vault: ${repairResult.created.length} file(s) bootstrapped, ` +
     `${repairResult.columnsUpgraded} column migration(s), ` +
     `${repairResult.columnShiftsRepaired || 0} column-shift repair(s), ` +
-    `${repairResult.emptyFilesRepaired} empty-file repair(s), ` +
-    `${repairResult.rowsRestored} row(s) reconciled`);
+    `${repairResult.emptyFilesRepaired || 0} empty-file repair(s), ` +
+    `${repairResult.rowsRestored || 0} row(s) reconciled` +
+    (VAULT_STORE_ENGINE === 'sqlite' ? ' (sqlite engine: self-heal passes not applicable, see BI26083001)' : ''));
 
   // Corpus health check (FI26082602, 26 Aug 2026): history/onthisday.tsv is
   // deliberately excluded from the auto-pull sync loop (sync-loop.js's
