@@ -105,11 +105,8 @@ async function main() {
     auditLog: (event, data) => auditLog.log(event, data),
   });
   console.log(`  vault: ${repairResult.created.length} file(s) bootstrapped, ` +
-    `${repairResult.columnsUpgraded} column migration(s), ` +
-    `${repairResult.columnShiftsRepaired || 0} column-shift repair(s), ` +
-    `${repairResult.emptyFilesRepaired || 0} empty-file repair(s), ` +
-    `${repairResult.rowsRestored || 0} row(s) reconciled` +
-    (VAULT_STORE_ENGINE === 'sqlite' ? ' (sqlite engine: self-heal passes not applicable, see BI26083001)' : ''));
+    `${repairResult.columnsUpgraded} column migration(s)` +
+    (VAULT_STORE_ENGINE === 'sqlite' ? ' (sqlite engine)' : ''));
 
   // Corpus health check (FI26082602, 26 Aug 2026): history/onthisday.tsv is
   // deliberately excluded from the auto-pull sync loop (sync-loop.js's

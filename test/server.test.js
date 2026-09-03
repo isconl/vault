@@ -248,8 +248,6 @@ test('POST /vault/bootstrap is idempotent -- main() already bootstraps on startu
     assert.ok(Array.isArray(body.created));
     assert.equal(body.created.length, 0, 'everything was already bootstrapped at server startup');
     assert.equal(body.columnsUpgraded, 0);
-    assert.equal(body.emptyFilesRepaired, 0);
-    assert.equal(body.rowsRestored, 0);
   } finally { server.close(); cleanup(); }
 });
 
