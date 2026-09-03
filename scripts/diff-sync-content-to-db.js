@@ -46,6 +46,15 @@ const CONTENT_TSVS = [
   { relPath: 'learning/courses.tsv', key: 'ID' },
 ];
 
+// Standing content-authoring docs outside any course folder (so
+// discoverLessonFiles' underscore-prefixed-folder skip never sees them) --
+// synced the same raw-file way as a lesson .md. Extend as more of these
+// turn up; course-standards.md is the first found needing it (edited
+// directly on 3 Sep 2026, same session this tool shipped in).
+const EXTRA_RAW_FILES = [
+  'learning/_standards/course-standards.md',
+];
+
 function loadState() {
   try {
     return JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
@@ -259,7 +268,7 @@ async function main() {
     syncTsvCollection(store, MEMORY_DIR, relPath, key, state, results);
   }
 
-  const lessonFiles = discoverLessonFiles(MEMORY_DIR);
+  const lessonFiles = [...discoverLessonFiles(MEMORY_DIR), ...EXTRA_RAW_FILES.filter((f) => fs.existsSync(path.join(MEMORY_DIR, f)))];
   totalChecked += lessonFiles.length;
   for (const relPath of lessonFiles) {
     syncLessonFile(store, MEMORY_DIR, relPath, state, results);
