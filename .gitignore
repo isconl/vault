@@ -8,3 +8,4 @@ runtime/
 # content, notifications, per-engine caches); it rehydrates from OneDrive
 # at boot and must never be committed.
 memory/
+_handoff/
