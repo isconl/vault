@@ -41,6 +41,10 @@ async function startServer(envOverrides = {}) {
     // would otherwise fire a real boot-time backup pass during every test
     // run using the sqlite engine (BI26083005 -- was VAULT_SYNC_INTERVAL_MS).
     VAULT_BACKUP_INTERVAL_MS: '0',
+    // Same reasoning as VAULT_BACKUP_INTERVAL_MS above -- explicit off in
+    // tests, not left to its 5-minute default, so a test run never fires a
+    // real content-diff-sync pass against a tmp fixture dir.
+    VAULT_CONTENT_SYNC_INTERVAL_MS: '0',
     // Same reasoning as VAULT_BACKUP_INTERVAL_MS above, for BM26082011's
     // Gmail sync loop -- explicit off in tests, not left to its 5-minute
     // default.

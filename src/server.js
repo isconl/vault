@@ -33,6 +33,7 @@ const onedriveBrowse = require('../lib/onedrive-browse');
 const { onThisDay } = require('../lib/onthisday');
 const narration = require('../lib/narration');
 const { createBackupLoop } = require('../lib/backup-loop');
+const { createContentSyncLoop } = require('../lib/content-sync-loop');
 const { createOneDriveBackupTarget } = require('../lib/backup/onedrive-target');
 const corporateDiscovery = require('../lib/corporate-discovery');
 const manifest = require('../lib/manifest');
@@ -235,6 +236,35 @@ async function main() {
     console.log(`  vault backup: enabled, every ${Math.round(VAULT_BACKUP_INTERVAL_MS / 1000)}s`);
   } else {
     console.log('  vault backup: disabled (set VAULT_BACKUP_INTERVAL_MS to enable)');
+  }
+
+  // -- 5.6. Content sync loop (file-based course/content authoring ->
+  // vault.db, on an interval; local-only, no network call) ----------------
+  // Closes the gap BI26090301's diff-sync tool only closed manually: a
+  // course .md file (or courses.tsv row) edited directly on disk -- by
+  // Gemini, by hand, by any tool -- now reaches vault.db on its own
+  // without someone remembering to run
+  // `node scripts/diff-sync-content-to-db.js` afterward. Per Sconl's
+  // explicit ask (3 Sep 2026): "I want all vault items to actually update
+  // in the database when we make additions or modifications or updates."
+  // Same shape as the backup loop above (start/stop/interval), and same
+  // "only meaningful on sqlite" gate -- the tsv engine has no separate DB
+  // to drift from the files. Default 5 minutes: frequent enough that a
+  // content session's edits show up live without anyone thinking about
+  // it, cheap enough (a filesystem walk + hash compare over a few hundred
+  // files, no network call) to not matter at that cadence. Safe by design
+  // even if this fires mid-edit on a half-written file: the conflict rule
+  // (file wins, logged) means the next pass a few minutes later just picks
+  // up the finished edit -- nothing is ever silently lost either direction.
+  const VAULT_CONTENT_SYNC_INTERVAL_MS = parseInt(process.env.VAULT_CONTENT_SYNC_INTERVAL_MS || secretStore.get('VAULT_CONTENT_SYNC_INTERVAL_MS') || String(5 * 60 * 1000), 10);
+  const contentSyncLoop = createContentSyncLoop({ store, memoryDir: MEMORY_DIR, statePath: process.env.VAULT_DIFF_SYNC_STATE || path.join(LOGS_DIR, '..', 'diff-sync-state.json'), auditLog });
+  if (VAULT_STORE_ENGINE !== 'sqlite') {
+    console.log(`  vault content-sync: disabled (VAULT_STORE_ENGINE=${VAULT_STORE_ENGINE}, needs the sqlite engine)`);
+  } else if (VAULT_CONTENT_SYNC_INTERVAL_MS > 0) {
+    contentSyncLoop.start(VAULT_CONTENT_SYNC_INTERVAL_MS);
+    console.log(`  vault content-sync: enabled, every ${Math.round(VAULT_CONTENT_SYNC_INTERVAL_MS / 1000)}s`);
+  } else {
+    console.log('  vault content-sync: disabled (set VAULT_CONTENT_SYNC_INTERVAL_MS to enable)');
   }
 
   // Corporate engagement org discovery (BC26082006) -- previously piggybacked
@@ -470,6 +500,18 @@ async function main() {
     }
     if (pathname === '/backup/status' && req.method === 'GET') {
       return sendJson(res, 200, { running: backupLoop.isRunning(), lastResult: backupLoop.getLastResult() });
+    }
+
+    // Force an immediate content-sync pass without waiting for
+    // VAULT_CONTENT_SYNC_INTERVAL_MS to elapse -- e.g. right after a
+    // content-authoring session, if the caller doesn't want to wait for
+    // the next scheduled pass.
+    if (pathname === '/content-sync/run' && req.method === 'POST') {
+      const result = await contentSyncLoop.runOnce();
+      return sendJson(res, 200, result);
+    }
+    if (pathname === '/content-sync/status' && req.method === 'GET') {
+      return sendJson(res, 200, { running: contentSyncLoop.isRunning(), lastResult: contentSyncLoop.getLastResult() });
     }
     if (pathname === '/backup/list' && req.method === 'GET') {
       const result = await backupTarget.list();
@@ -973,7 +1015,7 @@ async function main() {
     server.listen(PORT, BIND, () => {
       const actualPort = server.address().port;
       console.log(`  vault listening on ${BIND}:${actualPort}`);
-      resolve({ server, store, auth, graph, auditLog, secretStore, backupLoop, port: actualPort });
+      resolve({ server, store, auth, graph, auditLog, secretStore, backupLoop, contentSyncLoop, port: actualPort });
     });
   });
 }
