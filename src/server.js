@@ -176,7 +176,7 @@ async function main() {
   // account label, secrets keyed by label so a second account is just a
   // second entry in this Map, never a schema change. Only the label(s)
   // named in GOOGLE_ACCOUNTS actually get a client instantiated; the known
-  // account so far is a single one (sconl.vv@gmail.com, per the Corporate
+  // account so far is a single one (see VIVA_EMAIL secret, per the Corporate
   // Engagements plan), so this defaults to one label, 'default', if unset.
   const GOOGLE_ACCOUNT_LABELS = (process.env.GOOGLE_ACCOUNTS || 'default').split(',').map(s => s.trim()).filter(Boolean);
   const googleClients = new Map();
@@ -742,7 +742,7 @@ async function main() {
       const r = await googleCalendar.listEvents(google, { timeMin: searchParams.get('timeMin'), timeMax: searchParams.get('timeMax') });
       return sendJson(res, r.ok ? 200 : 502, r);
     }
-    // BI26082419: Microsoft Graph mail send (sconl@acexoft.com) -- the
+    // BI26082419: Microsoft Graph mail send (see ACE_EMAIL secret) -- the
     // token already requests Mail.Send (graph.js's GRAPH_SCOPE), this is
     // the first caller to actually exercise it.
     if (pathname === '/graph/mail/send' && req.method === 'POST') {
