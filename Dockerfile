@@ -6,7 +6,17 @@
 # N-API module: musl (alpine) breaks native bindings built against glibc.
 FROM node:20-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+# better-sqlite3-multiple-ciphers has no prebuilt binary for every
+# platform/arch combo (confirmed missing on linux-arm64, e.g. the OCI
+# Ampere A1 VM this fleet deploys to) -- npm falls back to compiling it
+# from source via node-gyp, which needs python3 + a C/C++ toolchain,
+# neither present in the base -slim image. @bitwarden/sdk-napi (every
+# other engine's only native dep) does ship prebuilt binaries and doesn't
+# need this -- only vault carries better-sqlite3-multiple-ciphers, so this
+# extra toolchain is deliberately just here, not copied into every
+# Dockerfile.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates python3 make g++ \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
