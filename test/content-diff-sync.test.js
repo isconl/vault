@@ -146,6 +146,57 @@ test('courses.tsv rows sync the same way: insert, then update-from-file on a lat
   assert.equal(store.read('learning/courses.tsv').find((r) => r.ID === 'demo-course-six').TITLE, 'Demo: A Retitled Test Course');
 });
 
+test('FI26090302: a schema column added after a row was last synced gets backfilled from the file, not stuck at its migration default', () => {
+  const memoryDir = tmpMemoryDir();
+  const store = fakeStore();
+  const tsvPath = path.join(memoryDir, 'learning', 'courses.tsv');
+  const sp = statePath(memoryDir);
+
+  // Baseline sync under the OLD (narrower) column set -- no GROUP_ID yet.
+  fs.writeFileSync(tsvPath, 'ID\tTITLE\ndemo-course-nine\tDemo: Nine\n');
+  runContentDiffSync({ store, memoryDir, statePath: sp });
+  assert.equal(store.read('learning/courses.tsv').find((r) => r.ID === 'demo-course-nine').GROUP_ID, undefined);
+
+  // The file gains GROUP_ID (a real authored value) AND, separately, the DB
+  // row picks up the new column via its own migration default ('-') --
+  // simulating sqlite-store's `ALTER TABLE ... ADD COLUMN "GROUP_ID" TEXT
+  // DEFAULT '-'` running between this sync and the next one.
+  fs.writeFileSync(tsvPath, 'ID\tTITLE\tGROUP_ID\ndemo-course-nine\tDemo: Nine\tcorporate-mandate\n');
+  const rows = store.read('learning/courses.tsv');
+  rows.find((r) => r.ID === 'demo-course-nine').GROUP_ID = '-';
+  store.rewrite('learning/courses.tsv', () => rows);
+
+  const result = runContentDiffSync({ store, memoryDir, statePath: sp });
+
+  assert.equal(result.conflicts.length, 0, 'a migration default must never be reported as a live-edit conflict');
+  assert.notEqual(result.changed.some((r) => r.kind === 'tsv-db-ahead-left-alone' && r.key === 'demo-course-nine'), true, 'must not be misread as a live DB edit worth preserving');
+  assert.equal(store.read('learning/courses.tsv').find((r) => r.ID === 'demo-course-nine').GROUP_ID, 'corporate-mandate');
+});
+
+test('FI26090302: a DB row whose key no longer exists in courses.tsv is pruned as stale, not left forever', () => {
+  const memoryDir = tmpMemoryDir();
+  const store = fakeStore();
+  const tsvPath = path.join(memoryDir, 'learning', 'courses.tsv');
+  const header = 'ID\tTITLE\tSTATUS';
+  fs.writeFileSync(tsvPath, `${header}\ndemo-course-eight\tDemo: Eight\tactive\n`);
+  const sp = statePath(memoryDir);
+
+  runContentDiffSync({ store, memoryDir, statePath: sp }); // baseline: DB gets demo-course-eight
+
+  // Simulate a pre-existing stale/duplicate row under an old ID scheme,
+  // written straight to the store (bypassing the file), the way FI26090302
+  // found 25 old-short-ID course rows still sitting in vault.db.
+  store.append('learning/courses.tsv', { ID: 'old-short-id', TITLE: 'Stale Duplicate', STATUS: 'active' });
+  assert.equal(store.read('learning/courses.tsv').length, 2);
+
+  const result = runContentDiffSync({ store, memoryDir, statePath: sp });
+
+  assert.equal(result.changed.some((r) => r.kind === 'tsv-pruned-stale-db-row' && r.key === 'old-short-id'), true);
+  const rows = store.read('learning/courses.tsv');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].ID, 'demo-course-eight');
+});
+
 test('dryRun leaves both the file and the DB untouched, but still reports what it would have done', () => {
   const memoryDir = tmpMemoryDir();
   const store = fakeStore();

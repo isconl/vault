@@ -44,7 +44,14 @@ async function main() {
   }
 
   const store = createSqliteStore({ memoryDir: MEMORY_DIR, logsDir: LOGS_DIR, schema: defaultSchema, dbKeyPassphrase });
-  if (!DRY_RUN) store.ensureVault();
+  // bootRepair (table create + column migration), not just ensureVault --
+  // a table that already existed before a schema column was added (e.g.
+  // GROUP_ID, learning/courses.tsv) otherwise keeps its old columns
+  // forever on this script's path, even though server.js's own boot
+  // sequence (src/server.js:97) already calls bootRepair for exactly this
+  // reason. Confirmed live 4 Sep 2026: this script failed with "no such
+  // column: GROUP_ID" against a real vault.db until fixed to match.
+  if (!DRY_RUN) store.bootRepair();
 
   const { totalChecked, changed, conflicts } = runContentDiffSync({ store, memoryDir: MEMORY_DIR, statePath: STATE_PATH, dryRun: DRY_RUN });
 
