@@ -1,0 +1,39 @@
+# Deploys this engine to the OCI VM (isconl.acexoft.com) on every push to
+# staging. Rebuilds and restarts only THIS engine's container -- the other
+# 6 keep running untouched, matching the "one unit, seven engines" docker
+# compose deploy (BI26090303).
+#
+# Deliberately raw SSH, not a third-party marketplace action (appleboy/
+# ssh-action etc) -- same reasoning as secrets-scan.yml choosing the
+# gitleaks CLI directly over the hosted Action: fewer moving parts outside
+# this repo's own control, nothing to silently break on someone else's
+# release.
+name: deploy-staging
+
+on:
+  push:
+    branches: [staging]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy vault to OCI VM
+        env:
+          SSH_KEY: ${{ secrets.OCI_VM_SSH_KEY }}
+          VM_HOST: ${{ secrets.OCI_VM_HOST }}
+          VM_USER: ${{ secrets.OCI_VM_USER }}
+        run: |
+          install -m 600 -D /dev/null ~/.ssh/deploy_key
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new "$VM_USER@$VM_HOST" '
+            set -e
+            cd ~/isconl-docker/vault
+            git fetch origin staging
+            git reset --hard origin/staging
+            cd ~/isconl-docker/deploy
+            sudo docker compose -f docker-compose.vm.yml build vault
+            sudo docker compose -f docker-compose.vm.yml up -d vault
+            sleep 5
+            curl -sf -m 10 http://127.0.0.1:8081/health || (echo "vault failed its post-deploy health check" >&2; exit 1)
+          '
