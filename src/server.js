@@ -315,6 +315,10 @@ async function main() {
   const authConfigured = !!(process.env.VAULT_TOKEN || process.env.ISCONL_TOKEN || secretStore.get('VAULT_TOKEN')
     || secretStore.get('TOTP_SECRET') || secretStore.get('ISCONL_TOTP_SECRET') || process.env.VAULT_PIN_HASH);
   const isLoopback = ['127.0.0.1', '::1', 'localhost'].includes(BIND);
+  if (process.env.ISCONL_DEV_NO_AUTH === '1' && !isLoopback) {
+    console.error('  REFUSING TO BIND: ISCONL_DEV_NO_AUTH is set but BIND is not loopback -- dev auth bypass is loopback-only.');
+    process.exit(1);
+  }
   if (!isLoopback && !authConfigured) {
     console.error('  REFUSING TO BIND: no credential configured and BIND is not loopback. ' +
       'Set VAULT_TOKEN, TOTP_SECRET (via Bitwarden), or VAULT_PIN_HASH first.');
