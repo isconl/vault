@@ -882,7 +882,7 @@ async function main() {
       return sendJson(res, result.ok ? 200 : 502, result);
     }
     // POST-with-body, not DELETE-with-query -- matches the file manager
-    // frontend's fmDeleteItem() contract (webconsole/static/app.js), which
+    // frontend's fmDeleteItem() contract (web/static/app.js), which
     // predates this backend and was built against the legacy monolith's
     // own route shape.
     if (pathname === '/onedrive/item/delete' && req.method === 'POST') {
