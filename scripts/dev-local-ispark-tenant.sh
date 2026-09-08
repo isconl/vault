@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# BL26082601 (E): local dev launcher for iScroll's dedicated tenant stack --
+# BL26082601 (E): local dev launcher for iSpark's dedicated tenant stack --
 # a separate `vault`+`spark` pair, own ports, own on-disk memory dir, from
 # the main isconl fleet's own vault (:8081)/spark (:8085) started by
 # hub/scripts/dev-local.sh. This is the "second set of ports, run locally"
@@ -18,23 +18,23 @@
 # picked to avoid any collision with a main-fleet instance running at the
 # same time on the same machine).
 #
-# Data root: work/dev/Systems/iSconl/_tenant-data/iscroll/ (sibling to every
+# Data root: work/dev/Systems/iSconl/_tenant-data/ispark/ (sibling to every
 # repo, not inside any one repo -- matches the manual run this same
 # directory already shows evidence of, 27 Aug 2026: vault-memory/,
 # vault-logs/, spark-logs/, vault.log, spark.log, vault.pid.txt).
 #
 # OneDrive: NOT wired up yet for this tenant (no Graph/OAuth app
-# registration done for "iScroll" specifically) -- VAULT_SYNC_INTERVAL_MS
+# registration done for "iSpark" specifically) -- VAULT_SYNC_INTERVAL_MS
 # is left unset here (sync disabled) until that's set up; see
 # vault/src/server.js's own comment on the /profile/photo route for the
 # same open item. Flagged, not silently built.
 #
-# Usage: ./dev-local-iscroll-tenant.sh [start|stop|status]
+# Usage: ./dev-local-ispark-tenant.sh [start|stop|status]
 
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"        # vault/
 ROOT="$(cd "$HERE/.." && pwd)"                                  # iSconl/
-TENANT_DIR="$ROOT/_tenant-data/iscroll"
+TENANT_DIR="$ROOT/_tenant-data/ispark"
 LOG_DIR="$TENANT_DIR"
 PID_DIR="$TENANT_DIR"
 mkdir -p "$TENANT_DIR/vault-memory" "$TENANT_DIR/vault-logs" "$TENANT_DIR/spark-logs" "$TENANT_DIR/spark-learning" "$TENANT_DIR/spark-articles"
@@ -50,7 +50,7 @@ if [ -z "${BWS_ACCESS_TOKEN:-}" ] && [ -f "$HOME/.isconl/bws-access-token" ]; th
   export BWS_ACCESS_TOKEN
 fi
 if [ -z "${BWS_ACCESS_TOKEN:-}" ]; then
-  echo "ERROR: BWS_ACCESS_TOKEN is not set. Cannot start the iScroll tenant stack -- vault will boot without secrets." >&2
+  echo "ERROR: BWS_ACCESS_TOKEN is not set. Cannot start the iSpark tenant stack -- vault will boot without secrets." >&2
   exit 1
 fi
 export BWS_ORGANIZATION_ID="${BWS_ORGANIZATION_ID:-2d82abe1-cb42-45a0-b1cd-b438013b3f4b}"
@@ -64,7 +64,7 @@ SPARK_PORT=8092
 start_vault() {
   local pidfile="$PID_DIR/vault.pid.txt"
   if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" | awk '{print $NF}')" 2>/dev/null; then
-    echo "vault-iscroll already running"
+    echo "vault-ispark already running"
     return
   fi
   (
@@ -87,16 +87,16 @@ start_vault() {
     fi
     local p=$!
     disown "$p" 2>/dev/null || true
-    echo "vault-iscroll pid $p" > "$pidfile"
+    echo "vault-ispark pid $p" > "$pidfile"
   )
   sleep 1
-  echo "vault-iscroll starting on :$VAULT_PORT, log: $LOG_DIR/vault.log"
+  echo "vault-ispark starting on :$VAULT_PORT, log: $LOG_DIR/vault.log"
 }
 
 start_spark() {
   local pidfile="$PID_DIR/spark.pid.txt"
   if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" | awk '{print $NF}')" 2>/dev/null; then
-    echo "spark-iscroll already running"
+    echo "spark-ispark already running"
     return
   fi
   (
@@ -111,10 +111,10 @@ start_spark() {
     fi
     local p=$!
     disown "$p" 2>/dev/null || true
-    echo "spark-iscroll pid $p" > "$pidfile"
+    echo "spark-ispark pid $p" > "$pidfile"
   )
   sleep 1
-  echo "spark-iscroll starting on :$SPARK_PORT, log: $LOG_DIR/spark.log"
+  echo "spark-ispark starting on :$SPARK_PORT, log: $LOG_DIR/spark.log"
 }
 
 stop_one() {
@@ -123,7 +123,7 @@ stop_one() {
   if [ -f "$pidfile" ]; then
     local pid
     pid="$(awk '{print $NF}' "$pidfile")"
-    kill "$pid" 2>/dev/null && echo "$name-iscroll stopped"
+    kill "$pid" 2>/dev/null && echo "$name-ispark stopped"
     rm -f "$pidfile"
   fi
 }
@@ -132,9 +132,9 @@ status_one() {
   local name="$1" port="$2"
   local pidfile="$PID_DIR/$name.pid.txt"
   if [ -f "$pidfile" ] && kill -0 "$(awk '{print $NF}' "$pidfile")" 2>/dev/null; then
-    echo "$name-iscroll: running (port $port)"
+    echo "$name-ispark: running (port $port)"
   else
-    echo "$name-iscroll: stopped"
+    echo "$name-ispark: stopped"
   fi
 }
 
