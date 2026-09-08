@@ -615,7 +615,7 @@ async function main() {
     // under memory/profile/ (outside store's utf8-only rawWrite, since this
     // is binary), and hand back a URL this same server can serve back via
     // GET /profile/photo below. OneDrive push is deliberately NOT wired here
-    // yet -- iScroll's dedicated tenant vault has no Graph/OAuth setup done
+    // yet -- iSpark's dedicated tenant vault has no Graph/OAuth setup done
     // for it, unlike the main fleet's vault; local-disk-only is the honest
     // v1, follow-up to push it through onedrive-browse.js's upload() once
     // that's set up for this tenant.
