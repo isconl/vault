@@ -36,6 +36,7 @@ const { createBackupLoop } = require('../lib/backup-loop');
 const { createContentSyncLoop } = require('../lib/content-sync-loop');
 const { createOneDriveBackupTarget } = require('../lib/backup/onedrive-target');
 const corporateDiscovery = require('../lib/corporate-discovery');
+const venturesDiscovery = require('../lib/ventures-discovery');
 const manifest = require('../lib/manifest');
 
 const PORT = parseInt(process.env.VAULT_PORT || process.env.PORT || '8081', 10);
@@ -296,6 +297,36 @@ async function main() {
     console.log('  corporate discovery: disabled (set CIRCLE_URL to enable)');
   }
 
+  // Ace venture discovery (BN26090610) -- same discover-then-push shape as
+  // corporate discovery above, but reached via rclone against a DIFFERENT
+  // OneDrive account (onedrive-acexoft, admin@acexoft.com) than vault's own
+  // Graph client, hence its own module rather than reusing corporateDiscovery.
+  const PULSE_URL = process.env.PULSE_URL || '';
+  const PULSE_TOKEN = process.env.PULSE_TOKEN || secretStore.get('PULSE_TOKEN') || '';
+  const VENTURES_DISCOVERY_INTERVAL_MS = parseInt(process.env.VENTURES_DISCOVERY_INTERVAL_MS || String(60 * 60 * 1000), 10);
+  let venturesDiscoveryTimer = null;
+  async function runVenturesDiscovery() {
+    try {
+      const found = await venturesDiscovery.discoverVentures();
+      if (!found.ok) { auditLog.log('ventures_discovery_failed', { error: found.error }); return found; }
+      const pushed = await venturesDiscovery.pushDiscoveredVentures(found.ventures, { pulseUrl: PULSE_URL, token: PULSE_TOKEN });
+      auditLog.log('ventures_discovery_pass', { ok: pushed.ok, seen: found.ventures.length, created: pushed.created?.length, error: pushed.error });
+      return { ok: pushed.ok, seen: found.ventures.length, ...pushed };
+    } catch (e) {
+      const error = String(e.message || e).slice(0, 200);
+      auditLog.log('ventures_discovery_failed', { error });
+      return { ok: false, error };
+    }
+  }
+  if (PULSE_URL) {
+    runVenturesDiscovery();
+    venturesDiscoveryTimer = setInterval(runVenturesDiscovery, VENTURES_DISCOVERY_INTERVAL_MS);
+    if (venturesDiscoveryTimer.unref) venturesDiscoveryTimer.unref();
+    console.log(`  ventures discovery: enabled, every ${Math.round(VENTURES_DISCOVERY_INTERVAL_MS / 1000)}s`);
+  } else {
+    console.log('  ventures discovery: disabled (set PULSE_URL to enable)');
+  }
+
   // -- 5.6. Gmail sync loop (BM26082011) --------------------------------------
   // Own interval, independent of the OneDrive one above -- polling Gmail on
   // OneDrive's cadence (or vice versa) would be a coincidence, not a design
@@ -494,6 +525,16 @@ async function main() {
     if (pathname === '/vault/bootstrap' && req.method === 'POST') {
       const result = store.bootRepair();
       return sendJson(res, 200, result);
+    }
+
+    // BN26090610: manual "re-run OneDrive sync" trigger for the editable
+    // ventures UI -- runs the same discover-then-push pass the interval
+    // loop above runs automatically, on demand, without waiting for
+    // VENTURES_DISCOVERY_INTERVAL_MS to elapse. Works even when PULSE_URL
+    // wasn't set at boot (reads it fresh from the environment each call).
+    if (pathname === '/ventures/discovery/run' && req.method === 'POST') {
+      const result = await runVenturesDiscovery();
+      return sendJson(res, result.ok === false && result.error && !result.seen ? 502 : 200, result);
     }
 
     // BI26083005: replaces /onedrive/sync-all -- force an immediate backup
