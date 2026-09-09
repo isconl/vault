@@ -126,6 +126,25 @@ test('a protected route with no credential fails closed (silent 404, not 401)', 
   } finally { server.close(); cleanup(); }
 });
 
+// BS26090501: dev-only auth bypass, loopback-gated. Confirms the flag actually
+// bypasses (else the escape hatch is useless) AND that leaving it unset keeps
+// the fail-closed behavior above -- a future refactor can't silently invert this.
+test('ISCONL_DEV_NO_AUTH=1 bypasses auth on loopback', async () => {
+  const { server, port, cleanup } = await startServer({ ISCONL_DEV_NO_AUTH: '1' });
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/vault/scope%2Ftasks.tsv`);
+    assert.notEqual(res.status, 404);
+  } finally { server.close(); cleanup(); }
+});
+
+test('ISCONL_DEV_NO_AUTH unset still fails closed with no credential', async () => {
+  const { server, port, cleanup } = await startServer();
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/vault/scope%2Ftasks.tsv`);
+    assert.equal(res.status, 404);
+  } finally { server.close(); cleanup(); }
+});
+
 test('a valid static token can write and then read back a vault row -- the full round trip', async () => {
   const { server, port, cleanup } = await startServer();
   try {
