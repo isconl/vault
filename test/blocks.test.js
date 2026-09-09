@@ -109,3 +109,67 @@ test('save() can flip a deactivated block back on -- the actual U8 gap, not just
   blocksModule.save({ id: 'BLK-LEARN', active: true });
   assert.ok(blocksModule.blocks().some(b => b.id === 'BLK-LEARN'), 'reactivated block must be back in the placement/scheduling view');
 });
+
+// -- BT26082416 (partial): equal sub-block time division with mini-breaks --
+
+test('divideBlockTime gives a single task the whole block, no breaks', () => {
+  const slots = blocksModule.divideBlockTime(120, 1);
+  assert.deepEqual(slots, [{ offsetMinutes: 0, durationMinutes: 120 }]);
+});
+
+test('divideBlockTime splits two tasks with one break between them', () => {
+  const slots = blocksModule.divideBlockTime(120, 2);
+  assert.equal(slots.length, 2);
+  // (120 - 1*5) / 2 = 57.5 each
+  assert.equal(slots[0].durationMinutes, 57.5);
+  assert.equal(slots[0].offsetMinutes, 0);
+  assert.equal(slots[1].offsetMinutes, 57.5 + 5);
+});
+
+test('divideBlockTime never inserts more than 2 breaks regardless of task count', () => {
+  const slots = blocksModule.divideBlockTime(120, 5);
+  assert.equal(slots.length, 5);
+  const totalBreakTime = 120 - slots.reduce((sum, s) => sum + s.durationMinutes, 0);
+  assert.equal(totalBreakTime, 10); // exactly 2 breaks x 5 min, not 4
+});
+
+test('divideBlockTime handles zero tasks', () => {
+  assert.deepEqual(blocksModule.divideBlockTime(120, 0), []);
+});
+
+test('clockAt wraps past midnight correctly', () => {
+  assert.equal(blocksModule.clockAt(23 * 60, 90), '00:30');
+});
+
+test('clockAt returns a plain HH:MM for a normal offset', () => {
+  assert.equal(blocksModule.clockAt(8 * 60, 65), '09:05');
+});
+
+test('plan() attaches a subBlock with real clock times to every placed task', () => {
+  tmpVault();
+  blocksModule.blocks(); // force seed
+  const tasks = [
+    { ID: 'T1', TITLE: 'Build the pipeline', STATUS: 'today', PRIORITY: 'high', DUE_DATE: '-', TAG: '' },
+    { ID: 'T2', TITLE: 'Automate the deploy', STATUS: 'today', PRIORITY: 'medium', DUE_DATE: '-', TAG: '' },
+  ];
+  const result = blocksModule.plan({ tasks, people: [], date: new Date('2026-08-13T09:00:00') });
+  const innovator = result.blocks.find(b => b.id === 'BLK-INN');
+  assert.equal(innovator.tasks.length, 2);
+  for (const t of innovator.tasks) {
+    assert.ok(t.subBlock, 'every placed task must carry a subBlock');
+    assert.match(t.subBlock.startClock, /^\d{2}:\d{2}$/);
+    assert.match(t.subBlock.endClock, /^\d{2}:\d{2}$/);
+  }
+  assert.equal(innovator.tasks[0].subBlock.startClock, '08:00');
+});
+
+test('plan() gives a lone task in a block the full duration with no break', () => {
+  tmpVault();
+  blocksModule.blocks();
+  const tasks = [{ ID: 'T1', TITLE: 'Build something', STATUS: 'today', PRIORITY: 'high', DUE_DATE: '-', TAG: '' }];
+  const result = blocksModule.plan({ tasks, people: [], date: new Date('2026-08-13T09:00:00') });
+  const innovator = result.blocks.find(b => b.id === 'BLK-INN');
+  assert.equal(innovator.tasks[0].subBlock.durationMinutes, 120);
+  assert.equal(innovator.tasks[0].subBlock.startClock, '08:00');
+  assert.equal(innovator.tasks[0].subBlock.endClock, '10:00');
+});

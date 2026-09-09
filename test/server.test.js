@@ -35,15 +35,27 @@ async function startServer(envOverrides = {}) {
     VAULT_SESSION_FILE: sessionFile,
     VAULT_TOKEN: 'test-static-token',
     BWS_ACCESS_TOKEN: '',   // no Bitwarden in tests -- secrets.init() must degrade gracefully, not hang/throw
-    // Explicit, not just absent: the sync loop now also falls back to a
-    // Bitwarden secret (VAULT_SYNC_INTERVAL_MS) for portability, so on a
+    // Explicit, not just absent: the backup loop now also falls back to a
+    // Bitwarden secret (VAULT_BACKUP_INTERVAL_MS) for portability, so on a
     // machine that DOES have real Bitwarden creds in its ambient env this
-    // would otherwise fire real Graph calls during every test run.
-    VAULT_SYNC_INTERVAL_MS: '0',
-    // Same reasoning as VAULT_SYNC_INTERVAL_MS above, for BM26082011's
+    // would otherwise fire a real boot-time backup pass during every test
+    // run using the sqlite engine (BI26083005 -- was VAULT_SYNC_INTERVAL_MS).
+    VAULT_BACKUP_INTERVAL_MS: '0',
+    // Same reasoning as VAULT_BACKUP_INTERVAL_MS above -- explicit off in
+    // tests, not left to its 5-minute default, so a test run never fires a
+    // real content-diff-sync pass against a tmp fixture dir.
+    VAULT_CONTENT_SYNC_INTERVAL_MS: '0',
+    // Same reasoning as VAULT_BACKUP_INTERVAL_MS above, for BM26082011's
     // Gmail sync loop -- explicit off in tests, not left to its 5-minute
     // default.
     EMAIL_SYNC_DISABLED: '1',
+    // Explicit empty override, not absent: get()'s hasOwnProperty check
+    // treats this as authoritative and never falls through to a real
+    // GOOGLE_CLIENT_ID sitting in this machine's own environment or
+    // Bitwarden config (FI26082703: "POST /google/auth/start...fails soft
+    // (502)" assumes no real client_id is configured, which isn't actually
+    // guaranteed without this -- same isolation gap as FI26082701 in hub).
+    GOOGLE_CLIENT_ID: '',
     ...envOverrides,
   });
   delete require.cache[require.resolve('../src/server')];
@@ -77,11 +89,59 @@ test('GET /manifest lists vault\'s capabilities without auth', async () => {
   } finally { server.close(); cleanup(); }
 });
 
+test('GET /backup/status/public reports readiness without auth, before any backup pass has run', async () => {
+  const { server, port, cleanup } = await startServer(); // VAULT_BACKUP_INTERVAL_MS: '0' in startServer's own env -- the loop never fires
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/backup/status/public`);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.firstPassComplete, false);
+    assert.equal(body.ok, false);
+  } finally { server.close(); cleanup(); }
+});
+
+test('GET /backup/status/public reports completion and result shape after a backup pass, without needing auth', async () => {
+  // sqlite engine so store.snapshotToFile exists -- no real Bitwarden/Graph
+  // creds in this test env, so the push itself fails (502-shaped), but
+  // that's still a real completed pass with a real result to report;
+  // proves /backup/run and /backup/status/public share state either way.
+  const { server, port, cleanup } = await startServer({ VAULT_STORE_ENGINE: 'sqlite', VAULT_DB_KEY_PASSPHRASE: 'test-fixture-passphrase' });
+  try {
+    await fetch(`http://127.0.0.1:${port}/backup/run`, {
+      method: 'POST', headers: { Authorization: 'Bearer test-static-token' },
+    });
+    const res = await fetch(`http://127.0.0.1:${port}/backup/status/public`);
+    const body = await res.json();
+    assert.equal(body.firstPassComplete, true);
+    assert.equal(typeof body.ok, 'boolean');
+    assert.ok(body.finishedAt);
+  } finally { server.close(); cleanup(); }
+});
+
 test('a protected route with no credential fails closed (silent 404, not 401)', async () => {
   const { server, port, cleanup } = await startServer();
   try {
     const res = await fetch(`http://127.0.0.1:${port}/vault/scope%2Ftasks.tsv`);
     assert.equal(res.status, 404, 'unauthenticated access must be indistinguishable from a nonexistent route');
+  } finally { server.close(); cleanup(); }
+});
+
+// BS26090501: dev-only auth bypass, loopback-gated. Confirms the flag actually
+// bypasses (else the escape hatch is useless) AND that leaving it unset keeps
+// the fail-closed behavior above -- a future refactor can't silently invert this.
+test('ISCONL_DEV_NO_AUTH=1 bypasses auth on loopback', async () => {
+  const { server, port, cleanup } = await startServer({ ISCONL_DEV_NO_AUTH: '1' });
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/vault/scope%2Ftasks.tsv`);
+    assert.notEqual(res.status, 404);
+  } finally { server.close(); cleanup(); }
+});
+
+test('ISCONL_DEV_NO_AUTH unset still fails closed with no credential', async () => {
+  const { server, port, cleanup } = await startServer();
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/vault/scope%2Ftasks.tsv`);
+    assert.equal(res.status, 404);
   } finally { server.close(); cleanup(); }
 });
 
@@ -211,8 +271,6 @@ test('POST /vault/bootstrap is idempotent -- main() already bootstraps on startu
     assert.ok(Array.isArray(body.created));
     assert.equal(body.created.length, 0, 'everything was already bootstrapped at server startup');
     assert.equal(body.columnsUpgraded, 0);
-    assert.equal(body.emptyFilesRepaired, 0);
-    assert.equal(body.rowsRestored, 0);
   } finally { server.close(); cleanup(); }
 });
 

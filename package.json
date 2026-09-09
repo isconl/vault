@@ -12,7 +12,8 @@
     "test": "node --test"
   },
   "dependencies": {
-    "@bitwarden/sdk-napi": "^1.0.0"
+    "@bitwarden/sdk-napi": "^1.0.0",
+    "better-sqlite3-multiple-ciphers": "^13.0.3"
   },
   "license": "MIT"
 }
