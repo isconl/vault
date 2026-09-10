@@ -29,15 +29,27 @@
 # vault/src/server.js's own comment on the /profile/photo route for the
 # same open item. Flagged, not silently built.
 #
+# EXTENDED 9 Sep 2026 (BL26082601): also starts hub-ispark, the gateway the
+# ispark Flutter app actually talks to (single base URL + fixed local
+# token, matching main.dart's hardcoded http://<lan-ip>:8890). Zero new
+# server code -- hub's own engine wiring is fully env-driven (an engine
+# with no *_URL set is just skipped), so this is the SAME hub codebase the
+# main fleet runs, pointed at this tenant's vault/spark and nothing else.
+# Also passes LIBRARY_MEMORY_DIR through to this tenant's vault, so
+# vault/lib/library-sync.js can read the iSpark Library's catalog --
+# start dev-local-library.sh first, or this tenant's Library catalog reads
+# degrade to ok:false (not a crash) until it's up.
+#
 # Usage: ./dev-local-ispark-tenant.sh [start|stop|status]
 
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"        # vault/
 ROOT="$(cd "$HERE/.." && pwd)"                                  # iSconl/
 TENANT_DIR="$ROOT/_tenant-data/ispark"
+LIBRARY_MEMORY_DIR_DEFAULT="$ROOT/_tenant-data/library/vault-memory"
 LOG_DIR="$TENANT_DIR"
 PID_DIR="$TENANT_DIR"
-mkdir -p "$TENANT_DIR/vault-memory" "$TENANT_DIR/vault-logs" "$TENANT_DIR/spark-logs" "$TENANT_DIR/spark-learning" "$TENANT_DIR/spark-articles"
+mkdir -p "$TENANT_DIR/vault-memory" "$TENANT_DIR/vault-logs" "$TENANT_DIR/spark-logs" "$TENANT_DIR/spark-learning" "$TENANT_DIR/spark-articles" "$TENANT_DIR/hub-logs"
 
 # Secrets -- identical bootstrap to hub/scripts/dev-local.sh (see that
 # file's own comment for the incident this guards against).
@@ -60,6 +72,7 @@ export BWS_PROJECT_ID="${BWS_PROJECT_ID:-ae96a9c3-5f66-48b7-96b2-b494009ff61b}"
 
 VAULT_PORT=8091
 SPARK_PORT=8092
+HUB_PORT=8890
 
 start_vault() {
   local pidfile="$PID_DIR/vault.pid.txt"
@@ -73,6 +86,7 @@ start_vault() {
     export VAULT_PORT="$VAULT_PORT"
     export VAULT_MEMORY_DIR="$TENANT_DIR/vault-memory"
     export VAULT_DIFF_SYNC_STATE="$TENANT_DIR/vault-logs/diff-sync-state.json"
+    export LIBRARY_MEMORY_DIR="${LIBRARY_MEMORY_DIR:-$LIBRARY_MEMORY_DIR_DEFAULT}"
     # OneDrive/Gmail sync intentionally left off -- see header comment. Gmail
     # sync in particular must stay off here: this tenant has no OAuth
     # identity of its own, so an enabled sync would pull the SAME Bitwarden-
@@ -117,6 +131,42 @@ start_spark() {
   echo "spark-ispark starting on :$SPARK_PORT, log: $LOG_DIR/spark.log"
 }
 
+start_hub() {
+  local pidfile="$PID_DIR/hub.pid.txt"
+  if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" | awk '{print $NF}')" 2>/dev/null; then
+    echo "hub-ispark already running"
+    return
+  fi
+  (
+    cd "$ROOT/hub"
+    export HUB_BIND=127.0.0.1
+    export HUB_PORT="$HUB_PORT"
+    export HUB_TOKEN="${ISPARK_HUB_TOKEN:-ispark-local-learning-2026}"
+    export VAULT_URL="http://127.0.0.1:$VAULT_PORT"
+    export SPARK_URL="http://127.0.0.1:$SPARK_PORT"
+    # Deliberately no PULSE_URL/SCOPE_URL/CIRCLE_URL/MEDIA_URL/OPS_URL --
+    # hub's own engine wiring treats an unconfigured engine as "not
+    # present" (engine_not_configured), not an error; iSpark only needs
+    # vault (auth/profile/ideas-storage/library-selection) + spark
+    # (learning/ideas). Same static HUB_TOKEN the app's main.dart already
+    # hardcodes -- change ISPARK_HUB_TOKEN here AND main.dart together if
+    # this ever needs to differ from the app's build-time constant.
+    # Defaults to the ispark repo's own real release-build output --
+    # override via ISPARK_APK_FILE for a different build.
+    export ISCONL_APK_FILE="${ISPARK_APK_FILE:-$ROOT/ispark/build/app/outputs/flutter-apk/app-release.apk}"
+    if command -v setsid >/dev/null 2>&1; then
+      setsid node src/server.js </dev/null >"$LOG_DIR/hub-logs/hub.log" 2>&1 &
+    else
+      nohup node src/server.js </dev/null >"$LOG_DIR/hub-logs/hub.log" 2>&1 &
+    fi
+    local p=$!
+    disown "$p" 2>/dev/null || true
+    echo "hub-ispark pid $p" > "$pidfile"
+  )
+  sleep 1
+  echo "hub-ispark starting on :$HUB_PORT, log: $LOG_DIR/hub-logs/hub.log"
+}
+
 stop_one() {
   local name="$1"
   local pidfile="$PID_DIR/$name.pid.txt"
@@ -143,14 +193,17 @@ case "$cmd" in
   start)
     start_vault
     start_spark
+    start_hub
     ;;
   stop)
     stop_one vault
     stop_one spark
+    stop_one hub
     ;;
   status)
     status_one vault "$VAULT_PORT"
     status_one spark "$SPARK_PORT"
+    status_one hub "$HUB_PORT"
     ;;
   *)
     echo "usage: $0 [start|stop|status]" >&2

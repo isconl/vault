@@ -37,6 +37,7 @@ const { createContentSyncLoop } = require('../lib/content-sync-loop');
 const { createOneDriveBackupTarget } = require('../lib/backup/onedrive-target');
 const corporateDiscovery = require('../lib/corporate-discovery');
 const venturesDiscovery = require('../lib/ventures-discovery');
+const { createLibrarySync } = require('../lib/library-sync');
 const manifest = require('../lib/manifest');
 
 const PORT = parseInt(process.env.VAULT_PORT || process.env.PORT || '8081', 10);
@@ -109,6 +110,19 @@ async function main() {
   console.log(`  vault: ${repairResult.created.length} file(s) bootstrapped, ` +
     `${repairResult.columnsUpgraded} column migration(s)` +
     (VAULT_STORE_ENGINE === 'sqlite' ? ' (sqlite engine)' : ''));
+
+  // BL26082601: iSpark Library selection + sync -- LIBRARY_MEMORY_DIR unset
+  // is a normal, expected state on the main fleet's own vault (this
+  // capability only matters on a tenant instance); librarySync.listCatalog()
+  // degrades to ok:false rather than throwing when it's unset.
+  const librarySync = createLibrarySync({
+    libraryMemoryDir: process.env.LIBRARY_MEMORY_DIR || '',
+    tenantMemoryDir: MEMORY_DIR,
+    readTSV: store.read,
+    appendTSV: store.append,
+    rewriteTSV: store.rewrite,
+    auditLog,
+  });
 
   // Corpus health check (FI26082602, 26 Aug 2026): history/onthisday.tsv is
   // deliberately excluded from the auto-pull sync loop (sync-loop.js's
@@ -633,6 +647,22 @@ async function main() {
     // generic /vault-raw/ wrapper so a client gets parsed JSON directly
     // instead of a {collection,text} envelope. Deliberately NOT tied to any
     // OAuth identity -- see BL26082601's tenant-isolation decision.
+    if (pathname === '/library/catalog' && req.method === 'GET') {
+      return sendJson(res, 200, librarySync.listCatalog());
+    }
+    if (pathname === '/library/selection' && req.method === 'GET') {
+      return sendJson(res, 200, { ok: true, selection: librarySync.getSelection() });
+    }
+    if (pathname === '/library/selection' && req.method === 'POST') {
+      let body = {};
+      try { body = JSON.parse(await readBody(req) || '{}'); } catch {}
+      const courseIds = Array.isArray(body.courseIds) ? body.courseIds.map(String) : [];
+      try {
+        return sendJson(res, 200, librarySync.setSelection(courseIds));
+      } catch (e) {
+        return sendJson(res, 400, { ok: false, error: String(e.message || e) });
+      }
+    }
     if (pathname === '/profile' && req.method === 'GET') {
       const text = store.rawRead('profile/settings.json');
       let profile = {};
