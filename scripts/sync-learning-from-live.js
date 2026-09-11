@@ -11,14 +11,20 @@
  * deploy pipeline itself trusts (HUB_TOKEN), not the OneDrive backup
  * archive and not SSH.
  *
- * Deliberately scoped to learning/courses only, matching what was actually
- * asked for ("I just want the courses loading on localhost accurately") --
- * not a general-purpose whole-vault mirror. Deliberately skips
- * progress.tsv/resume.tsv/modules_meta.tsv -- those are personal
- * interaction state, not course content, and overwriting them from live
- * would erase local dev-session state for no benefit. Confirmed with
- * Sconl this machine is dev/testing only, never where course CONTENT is
- * authored -- a full one-way overwrite of course content is safe here.
+ * Scoped to learning/* -- courses, lesson content, AND Sconl's own
+ * progress/resume/activity state (progress.tsv, resume.tsv) -- but not
+ * modules_meta.tsv (per-module editorial metadata, not interaction state,
+ * out of scope so far). Originally shipped courses+lessons only; extended
+ * same day after Sconl flagged the "Learning Activity" contribution graph
+ * itself disagreeing between localhost and live (41 contributions/14
+ * active days live vs 3/1 local, different "Continue Learning" lesson) --
+ * that view reads progress.tsv/resume.tsv, which the first version
+ * deliberately hadn't touched on the theory that it was personal
+ * dev-session state worth preserving. Wrong call: Sconl's own real
+ * activity IS the thing he wants mirrored, not a hypothetical local
+ * testing session's. Confirmed this machine is dev/testing only, never
+ * where content is authored -- a full one-way overwrite of course
+ * content AND activity state is safe here.
  *
  * Staleness-aware by default: a course whose live UPDATED_AT/LESSON_COUNT
  * already matches local's is skipped entirely (no lesson fetches) -- this
@@ -86,42 +92,86 @@ async function main() {
   });
 
   console.log(`  ${liveCourses.length} course(s) live, ${staleCourses.length} stale/new (${liveCourses.length - staleCourses.length} already current, skipped).`);
-  if (!staleCourses.length) { console.log('Nothing to do -- local already matches live.'); return; }
 
   let coursesWritten = 0;
   let lessonsWritten = 0;
   let lessonErrors = 0;
 
-  // courses.tsv: upsert only the rows actually being (re)synced -- any
-  // other local-only rows (shouldn't exist on a dev/testing machine, but
-  // don't assume) are left untouched rather than wiped.
-  store.rewrite('learning/courses.tsv', (rows) => {
-    const byId = new Map(rows.map((r) => [r.ID, r]));
-    for (const c of staleCourses) {
-      const row = {};
-      for (const col of SCHEMA_COLS) row[col] = c[col] !== undefined && c[col] !== null ? String(c[col]) : '-';
-      byId.set(c.ID, row);
-      coursesWritten++;
-    }
-    return Array.from(byId.values());
-  }, { force: true });
+  if (staleCourses.length) {
+    // courses.tsv: upsert only the rows actually being (re)synced -- any
+    // other local-only rows (shouldn't exist on a dev/testing machine, but
+    // don't assume) are left untouched rather than wiped.
+    store.rewrite('learning/courses.tsv', (rows) => {
+      const byId = new Map(rows.map((r) => [r.ID, r]));
+      for (const c of staleCourses) {
+        const row = {};
+        for (const col of SCHEMA_COLS) row[col] = c[col] !== undefined && c[col] !== null ? String(c[col]) : '-';
+        byId.set(c.ID, row);
+        coursesWritten++;
+      }
+      return Array.from(byId.values());
+    }, { force: true });
 
-  for (const c of staleCourses) {
-    for (const lesson of c.lessons || []) {
-      try {
-        const lessonUrl = `${baseUrl}/api/learning/lesson?course=${encodeURIComponent(c.ID)}&file=${encodeURIComponent(lesson.file)}`;
-        const result = await fetchJson(lessonUrl, token);
-        if (typeof result.content !== 'string') throw new Error('no content in response');
-        store.rawWrite(`learning/${c.ID}/${lesson.file}`, result.content, { force: true });
-        lessonsWritten++;
-      } catch (e) {
-        lessonErrors++;
-        console.error(`  lesson fetch failed: ${c.ID}/${lesson.file}: ${e.message}`);
+    for (const c of staleCourses) {
+      for (const lesson of c.lessons || []) {
+        try {
+          const lessonUrl = `${baseUrl}/api/learning/lesson?course=${encodeURIComponent(c.ID)}&file=${encodeURIComponent(lesson.file)}`;
+          const result = await fetchJson(lessonUrl, token);
+          if (typeof result.content !== 'string') throw new Error('no content in response');
+          store.rawWrite(`learning/${c.ID}/${lesson.file}`, result.content, { force: true });
+          lessonsWritten++;
+        } catch (e) {
+          lessonErrors++;
+          console.error(`  lesson fetch failed: ${c.ID}/${lesson.file}: ${e.message}`);
+        }
       }
     }
   }
 
-  console.log(`Done. ${coursesWritten} course row(s) written, ${lessonsWritten} lesson file(s) synced, ${lessonErrors} lesson error(s).`);
+  // progress.tsv + resume.tsv: Sconl's own real activity -- the "Learning
+  // Activity" contribution graph and "Continue Learning" resume position
+  // read these. Always compared against every live course (not gated
+  // behind the course-content staleness filter above), since a lesson can
+  // be freshly completed without its course's own UPDATED_AT/LESSON_COUNT
+  // changing at all -- these are cheap (no extra HTTP calls, the data's
+  // already in `live`), so the only cost worth avoiding is an unnecessary
+  // DB write when nothing actually changed.
+  const PROGRESS_COLS = ['COURSE_ID', 'LESSON', 'STATUS', 'UPDATED_AT'];
+  const progressRows = [];
+  for (const c of liveCourses) {
+    for (const lesson of c.lessons || []) {
+      if (!lesson.status || lesson.status === 'new') continue; // no real progress row for an untouched lesson
+      progressRows.push({ COURSE_ID: c.ID, LESSON: lesson.file, STATUS: lesson.status, UPDATED_AT: lesson.touchedAt || '-' });
+    }
+  }
+  const RESUME_COLS = ['COURSE_ID', 'LESSON', 'SCROLL_PCT', 'UPDATED_AT'];
+  const resumeRows = (live.resume || []).map((r) => {
+    const row = {};
+    for (const col of RESUME_COLS) row[col] = r[col] !== undefined && r[col] !== null ? String(r[col]) : '-';
+    return row;
+  });
+
+  const rowsEqual = (a, b, cols) => a.length === b.length && a.every((r, i) => cols.every((c) => String(r[c] || '') === String(b[i][c] || '')));
+  const localProgress = store.read('learning/progress.tsv');
+  const localResume = store.read('learning/resume.tsv');
+  let progressChanged = false, resumeChanged = false;
+  if (!rowsEqual(localProgress, progressRows, PROGRESS_COLS)) {
+    store.rewrite('learning/progress.tsv', () => progressRows, { force: true });
+    progressChanged = true;
+  }
+  if (!rowsEqual(localResume, resumeRows, RESUME_COLS)) {
+    store.rewrite('learning/resume.tsv', () => resumeRows, { force: true });
+    resumeChanged = true;
+  }
+
+  if (!staleCourses.length && !progressChanged && !resumeChanged) {
+    console.log('Nothing to do -- local already matches live (courses, progress, and resume).');
+    return;
+  }
+
+  console.log(`Done. ${coursesWritten} course row(s) written, ${lessonsWritten} lesson file(s) synced, ` +
+    `progress ${progressChanged ? `updated (${progressRows.length} row(s))` : 'unchanged'}, ` +
+    `resume ${resumeChanged ? `updated (${resumeRows.length} row(s))` : 'unchanged'}, ${lessonErrors} lesson error(s).`);
   if (lessonErrors > 0) process.exitCode = 1;
 }
 
