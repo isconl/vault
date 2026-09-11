@@ -983,6 +983,33 @@ async function main() {
       return sendJson(res, 200, { date, phrase: row ? row.PHRASE : null });
     }
 
+    // BT26091001: per-cycle equicycle theme override. cycleKey is
+    // "<eqYear>-<cycleNum>" -- the client already computes both (see
+    // app.js's localDayNow()), so this route trusts it rather than
+    // re-deriving the equicycle date math server-side.
+    if (pathname === '/cycle-theme' && req.method === 'GET') {
+      const { searchParams } = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+      const cycleKey = searchParams.get('cycleKey');
+      if (!cycleKey) return sendJson(res, 400, { ok: false, error: 'cycleKey required' });
+      const row = store.read('scope/cycle_themes.tsv').find(r => r.CYCLE_KEY === cycleKey);
+      return sendJson(res, 200, { cycleKey, theme: row ? row.THEME : null });
+    }
+
+    if (pathname === '/cycle-theme' && req.method === 'POST') {
+      let body = {};
+      try { body = JSON.parse(await readBody(req) || '{}'); } catch {}
+      const cycleKey = body.cycleKey;
+      const theme = (body.theme || '').trim();
+      if (!cycleKey) return sendJson(res, 400, { ok: false, error: 'cycleKey required' });
+      store.rewrite('scope/cycle_themes.tsv', (rows) => {
+        const kept = rows.filter(r => r.CYCLE_KEY !== cycleKey);
+        if (theme) kept.push({ CYCLE_KEY: cycleKey, THEME: theme, ADDED_AT: new Date().toISOString() });
+        return kept;
+      }, { why: 'POST /cycle-theme' });
+      auditLog.log('cycle_theme_set', { cycleKey, theme: theme || null });
+      return sendJson(res, 200, { ok: true, cycleKey, theme: theme || null });
+    }
+
     if (pathname === '/onthisday' && req.method === 'GET') {
       const { searchParams } = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
       const date = searchParams.get('date') || null;

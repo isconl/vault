@@ -195,6 +195,71 @@ test('PUT /vault/:collection replaces the whole row set -- the read-modify-write
   } finally { server.close(); cleanup(); }
 });
 
+test('GET /cycle-theme returns theme:null when no override has been written for that cycle', async () => {
+  const { server, port, cleanup } = await startServer();
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/cycle-theme?cycleKey=2026-4`, {
+      headers: { Authorization: 'Bearer test-static-token' },
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.cycleKey, '2026-4');
+    assert.equal(body.theme, null);
+  } finally { server.close(); cleanup(); }
+});
+
+test('GET /cycle-theme requires cycleKey', async () => {
+  const { server, port, cleanup } = await startServer();
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/cycle-theme`, {
+      headers: { Authorization: 'Bearer test-static-token' },
+    });
+    assert.equal(res.status, 400);
+  } finally { server.close(); cleanup(); }
+});
+
+test('POST /cycle-theme sets an override, then GET returns it -- and an empty theme clears it back to null', async () => {
+  const { server, port, cleanup } = await startServer();
+  try {
+    const set = await fetch(`http://127.0.0.1:${port}/cycle-theme`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer test-static-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cycleKey: '2026-4', theme: 'Leverage' }),
+    });
+    assert.equal(set.status, 200);
+    const setBody = await set.json();
+    assert.equal(setBody.ok, true);
+    assert.equal(setBody.theme, 'Leverage');
+
+    const read = await fetch(`http://127.0.0.1:${port}/cycle-theme?cycleKey=2026-4`, {
+      headers: { Authorization: 'Bearer test-static-token' },
+    });
+    const readBody = await read.json();
+    assert.equal(readBody.theme, 'Leverage');
+
+    // A second cycle's key stays untouched by the first override.
+    const other = await fetch(`http://127.0.0.1:${port}/cycle-theme?cycleKey=2026-5`, {
+      headers: { Authorization: 'Bearer test-static-token' },
+    });
+    const otherBody = await other.json();
+    assert.equal(otherBody.theme, null);
+
+    const clear = await fetch(`http://127.0.0.1:${port}/cycle-theme`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer test-static-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cycleKey: '2026-4', theme: '' }),
+    });
+    const clearBody = await clear.json();
+    assert.equal(clearBody.theme, null);
+
+    const readAfterClear = await fetch(`http://127.0.0.1:${port}/cycle-theme?cycleKey=2026-4`, {
+      headers: { Authorization: 'Bearer test-static-token' },
+    });
+    const readAfterClearBody = await readAfterClear.json();
+    assert.equal(readAfterClearBody.theme, null);
+  } finally { server.close(); cleanup(); }
+});
+
 test('PUT /vault/:collection forwards force:true so a legitimate bulk delete over half the rows actually happens, not silently refused', async () => {
   const { server, port, cleanup } = await startServer();
   try {
