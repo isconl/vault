@@ -151,6 +151,31 @@ async function main() {
     return row;
   });
 
+  // BL26091111: mirror live's own contribution map. Local spark computes this
+  // from ITS OWN audit log, which on a dev machine is nearly empty -- almost
+  // all real reading happens on live -- so the "Learning activity" heatmap
+  // rendered as a blank year locally while live's looked correct. Per Sconl,
+  // the data driving the live map is the data the local map should show.
+  //
+  // Read-only, no new backend route: /api/learning/contributions already
+  // exists and is what live's own UI calls. spark reads this mirror in
+  // preference to its audit log when the file is present; the file is only
+  // ever written here, and this script only ever runs locally, so live is
+  // unaffected.
+  const CONTRIB_COLS = ['DATE', 'COUNT'];
+  let contribRows = [];
+  let contribChanged = false;
+  try {
+    const liveContrib = await fetchJson(`${baseUrl}/api/learning/contributions`, token);
+    contribRows = (liveContrib.days || [])
+      .filter((d) => d && d.date)
+      .map((d) => ({ DATE: String(d.date), COUNT: String(Number(d.count) || 0) }));
+  } catch (e) {
+    // Non-fatal by design: a failed contributions fetch must not sink a course
+    // sync that otherwise succeeded. The heatmap keeps whatever it last had.
+    console.error(`  contributions fetch failed (heatmap left as-is): ${e.message}`);
+  }
+
   const rowsEqual = (a, b, cols) => a.length === b.length && a.every((r, i) => cols.every((c) => String(r[c] || '') === String(b[i][c] || '')));
   const localProgress = store.read('learning/progress.tsv');
   const localResume = store.read('learning/resume.tsv');
@@ -163,15 +188,23 @@ async function main() {
     store.rewrite('learning/resume.tsv', () => resumeRows, { force: true });
     resumeChanged = true;
   }
+  if (contribRows.length) {
+    const localContrib = store.read('learning/contributions.tsv');
+    if (!rowsEqual(localContrib, contribRows, CONTRIB_COLS)) {
+      store.rewrite('learning/contributions.tsv', () => contribRows, { force: true });
+      contribChanged = true;
+    }
+  }
 
-  if (!staleCourses.length && !progressChanged && !resumeChanged) {
-    console.log('Nothing to do -- local already matches live (courses, progress, and resume).');
+  if (!staleCourses.length && !progressChanged && !resumeChanged && !contribChanged) {
+    console.log('Nothing to do -- local already matches live (courses, progress, resume, and contributions).');
     return;
   }
 
   console.log(`Done. ${coursesWritten} course row(s) written, ${lessonsWritten} lesson file(s) synced, ` +
     `progress ${progressChanged ? `updated (${progressRows.length} row(s))` : 'unchanged'}, ` +
-    `resume ${resumeChanged ? `updated (${resumeRows.length} row(s))` : 'unchanged'}, ${lessonErrors} lesson error(s).`);
+    `resume ${resumeChanged ? `updated (${resumeRows.length} row(s))` : 'unchanged'}, ` +
+    `contributions ${contribChanged ? `updated (${contribRows.length} day(s))` : 'unchanged'}, ${lessonErrors} lesson error(s).`);
   if (lessonErrors > 0) process.exitCode = 1;
 }
 
