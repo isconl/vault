@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { createBackupLoop } = require('../lib/backup-loop');
+const { createBackupLoop, DEFAULT_MIN_CONTENT_ROWS } = require('../lib/backup-loop');
 
 function fakeStore({ memoryDir, snapshotError = null } = {}) {
   const dir = memoryDir || fs.mkdtempSync(path.join(os.tmpdir(), 'backup-loop-store-'));
@@ -154,6 +154,95 @@ test('getLastResult reflects the most recent completed pass', async () => {
   assert.equal(loop.getLastResult(), null);
   const result = await loop.runOnce();
   assert.deepEqual(loop.getLastResult(), result);
+});
+
+// -- BI26091201: emptiness guard ------------------------------------------
+// A store that reports its content row counts, the way the real sqlite store
+// does. The fakes above deliberately DON'T have contentStats -- that's the
+// tsv-engine/legacy shape, and every test above doubles as proof the guard
+// stays out of the way when a store can't answer the question.
+function countingStore(totalRows, opts = {}) {
+  const store = fakeStore(opts);
+  store.contentStats = () => ({
+    totalRows,
+    counts: { 'learning/courses.tsv': totalRows, raw_blobs: 0 },
+  });
+  return store;
+}
+
+test('runOnce refuses to push a database with no real content in it, and says why', async () => {
+  const store = countingStore(0);
+  const backupTarget = fakeBackupTarget();
+  const loop = createBackupLoop({ store, backupTarget });
+
+  const result = await loop.runOnce();
+
+  assert.equal(result.skipped, 'empty database');
+  assert.equal(result.totalRows, 0);
+  assert.equal(result.minContentRows, DEFAULT_MIN_CONTENT_ROWS);
+  assert.equal(store.snapshotCalls.length, 0, 'must not even snapshot an empty DB');
+  assert.equal(backupTarget.pushCalls.length, 0, 'an empty DB must never reach the shared backup history');
+  assert.equal(backupTarget.pruneCalls.length, 0, 'and must never trigger retention against good generations');
+});
+
+test('a near-empty database is skipped too -- the guard is a threshold, not a zero-check', async () => {
+  const store = countingStore(DEFAULT_MIN_CONTENT_ROWS - 1);
+  const backupTarget = fakeBackupTarget();
+  const loop = createBackupLoop({ store, backupTarget });
+
+  const result = await loop.runOnce();
+
+  assert.equal(result.skipped, 'empty database');
+  assert.equal(backupTarget.pushCalls.length, 0);
+});
+
+test('a database at or above the threshold pushes normally', async () => {
+  const store = countingStore(DEFAULT_MIN_CONTENT_ROWS);
+  const backupTarget = fakeBackupTarget();
+  const loop = createBackupLoop({ store, backupTarget });
+
+  const result = await loop.runOnce();
+
+  assert.equal(result.ok, true);
+  assert.equal(backupTarget.pushCalls.length, 1);
+});
+
+test('the threshold is configurable per loop', async () => {
+  const store = countingStore(5);
+  const backupTarget = fakeBackupTarget();
+  const loop = createBackupLoop({ store, backupTarget, minContentRows: 3 });
+
+  const result = await loop.runOnce();
+
+  assert.equal(result.ok, true, '5 rows clears a threshold of 3');
+});
+
+test('an empty-DB skip is reported through getLastResult and audit-logged, not silently swallowed', async () => {
+  const store = countingStore(0);
+  const backupTarget = fakeBackupTarget();
+  const logged = [];
+  const loop = createBackupLoop({
+    store, backupTarget, auditLog: { log: (event, data) => logged.push({ event, data }) },
+  });
+
+  const result = await loop.runOnce();
+
+  assert.deepEqual(loop.getLastResult(), result);
+  assert.equal(logged.length, 1);
+  assert.equal(logged[0].event, 'vault_backup_skipped_empty');
+  assert.equal(logged[0].data.totalRows, 0);
+});
+
+test('a store whose contentStats throws still backs up -- the guard must never break backups itself', async () => {
+  const store = fakeStore();
+  store.contentStats = () => { throw new Error('table missing'); };
+  const backupTarget = fakeBackupTarget();
+  const loop = createBackupLoop({ store, backupTarget });
+
+  const result = await loop.runOnce();
+
+  assert.equal(result.ok, true);
+  assert.equal(backupTarget.pushCalls.length, 1);
 });
 
 test('never pulls anything -- this loop is one-directional, local-to-remote only (no fetch/pull calls exist on the interface it uses)', async () => {

@@ -230,27 +230,52 @@ async function main() {
 
   // -- 5.5. Backup loop (encrypted whole-DB snapshot -> OneDrive, on an
   // interval; local-to-remote only, one-directional, no pull ever) --------
-  // Off by default for the same reason the old sync loop was: the test
-  // suite calls main() repeatedly with no real Graph credentials
-  // configured, and an enabled-by-default loop would fire real HTTPS calls
-  // per test. Falls back to a Bitwarden secret (not just the env var), same
-  // as the old VAULT_SYNC_INTERVAL_MS did, so this survives a fresh clone
-  // on any deploy path. Default 30 minutes (1800000ms) when explicitly
-  // enabled with no value -- a deliberate, visible choice distinct from the
-  // old pull loop's 900s tuning (that number was about pull freshness; this
-  // one is about acceptable backup recovery-point-objective), not silently
-  // inherited. Only meaningful on the sqlite engine (needs
+  // OFF unless explicitly enabled (BI26091201, 12 Sep 2026, per Sconl --
+  // this fallback used to be 30 minutes, i.e. backups ON for anyone who
+  // didn't know to turn them off). Every machine running vault shares ONE
+  // OneDrive backup history, so "on by default" meant every dev checkout
+  // silently pushed generations into the same history the OCI VM's disaster
+  // recovery depends on -- PI26091001/OI26091001: a fresh Windows checkout
+  // put three near-empty ~196KB generations in among another machine's real
+  // ~24MB ones, cleaned up by hand. Opting in is now a deliberate act, made
+  // once, on the one machine that should be the designated pusher: the VM
+  // sets VAULT_BACKUP_INTERVAL_MS=1800000 explicitly in
+  // deploy/docker-compose.vm.yml, so live behaviour is unchanged. The
+  // launchers' own VAULT_BACKUP_INTERVAL_MS=0 defaults (FI26091203) become
+  // belt-and-braces rather than the only thing standing between a dev
+  // machine and the shared history.
+  //
+  // Still falls back to a Bitwarden secret (not just the env var), same as
+  // the old VAULT_SYNC_INTERVAL_MS did, so an enabled deploy survives a
+  // fresh clone on any deploy path. 1800000 (30 minutes) is the intended
+  // value where it IS enabled -- a deliberate choice about acceptable
+  // backup recovery-point-objective, distinct from the old pull loop's 900s
+  // freshness tuning. Only meaningful on the sqlite engine (needs
   // store.snapshotToFile) -- skipped with a clear log line on 'tsv'.
-  const VAULT_BACKUP_INTERVAL_MS = parseInt(process.env.VAULT_BACKUP_INTERVAL_MS || secretStore.get('VAULT_BACKUP_INTERVAL_MS') || String(30 * 60 * 1000), 10);
+  const VAULT_BACKUP_INTERVAL_MS = parseInt(process.env.VAULT_BACKUP_INTERVAL_MS || secretStore.get('VAULT_BACKUP_INTERVAL_MS') || '0', 10);
   const backupTarget = createOneDriveBackupTarget({ graph });
-  const backupLoop = createBackupLoop({ store, backupTarget, auditLog });
+  // BI26091201: the emptiness guard's threshold (rows across the key content
+  // collections, see sqlite-store.js contentStats()). Overridable, but only
+  // deliberately: the only real reason to lower it is a genuinely tiny vault
+  // that should still be backed up, and the only reason to raise it is a
+  // machine whose "restored" bar is higher than "not literally empty".
+  const backupMinRows = process.env.VAULT_BACKUP_MIN_CONTENT_ROWS;
+  const backupLoop = createBackupLoop({
+    store, backupTarget, auditLog,
+    ...(backupMinRows !== undefined && backupMinRows !== '' ? { minContentRows: parseInt(backupMinRows, 10) } : {}),
+  });
   if (VAULT_STORE_ENGINE !== 'sqlite') {
     console.log(`  vault backup: disabled (VAULT_STORE_ENGINE=${VAULT_STORE_ENGINE}, backups need the sqlite engine)`);
   } else if (VAULT_BACKUP_INTERVAL_MS > 0) {
     backupLoop.start(VAULT_BACKUP_INTERVAL_MS);
-    console.log(`  vault backup: enabled, every ${Math.round(VAULT_BACKUP_INTERVAL_MS / 1000)}s`);
+    // BI26091201: say this out loud on the enabled path too, so "this machine
+    // is the one pushing into the shared OneDrive history" is visible in ops
+    // logs rather than inferred from the absence of the disabled line below.
+    console.log(`  vault backup: ENABLED, every ${Math.round(VAULT_BACKUP_INTERVAL_MS / 1000)}s -- this machine pushes generations into the shared OneDrive backup history`);
   } else {
-    console.log('  vault backup: disabled (set VAULT_BACKUP_INTERVAL_MS to enable)');
+    // BI26091201: backups are opt-in now, so this is the NORMAL path on every
+    // dev machine -- worded so it doesn't read like a misconfiguration.
+    console.log('  vault backup: off (opt-in; set VAULT_BACKUP_INTERVAL_MS=1800000 to make this machine push into the shared OneDrive backup history)');
   }
 
   // -- 5.6. Content sync loop (file-based course/content authoring ->
@@ -390,6 +415,12 @@ async function main() {
         running: backupLoop.isRunning(),
         firstPassComplete: !!r,
         ok: r ? !!r.ok : false,
+        // BI26091201: a pass can now end in a deliberate skip ('empty
+        // database') rather than a success or a failure. Surface it here, or
+        // a machine skipping every single pass looks identical to one that
+        // has simply never succeeded -- and the whole point of the guard is
+        // that it's a visible, explainable refusal.
+        skipped: r && r.skipped ? r.skipped : null,
         error: r ? r.error : null,
         startedAt: r ? r.startedAt : null,
         finishedAt: r ? r.finishedAt : null,

@@ -105,7 +105,15 @@ test('GET /backup/status/public reports completion and result shape after a back
   // creds in this test env, so the push itself fails (502-shaped), but
   // that's still a real completed pass with a real result to report;
   // proves /backup/run and /backup/status/public share state either way.
-  const { server, port, cleanup } = await startServer({ VAULT_STORE_ENGINE: 'sqlite', VAULT_DB_KEY_PASSPHRASE: 'test-fixture-passphrase' });
+  // VAULT_BACKUP_MIN_CONTENT_ROWS=0 (BI26091201): this fixture vault is
+  // freshly bootstrapped and therefore empty, which the emptiness guard would
+  // otherwise -- correctly -- refuse to back up. This test is about the
+  // status endpoint sharing state with /backup/run, so the guard is turned
+  // off here; the test below covers the guard's own behaviour end to end.
+  const { server, port, cleanup } = await startServer({
+    VAULT_STORE_ENGINE: 'sqlite', VAULT_DB_KEY_PASSPHRASE: 'test-fixture-passphrase',
+    VAULT_BACKUP_MIN_CONTENT_ROWS: '0',
+  });
   try {
     await fetch(`http://127.0.0.1:${port}/backup/run`, {
       method: 'POST', headers: { Authorization: 'Bearer test-static-token' },
@@ -115,6 +123,30 @@ test('GET /backup/status/public reports completion and result shape after a back
     assert.equal(body.firstPassComplete, true);
     assert.equal(typeof body.ok, 'boolean');
     assert.ok(body.finishedAt);
+    assert.equal(body.skipped, null, 'a real pass ran -- nothing was skipped');
+  } finally { server.close(); cleanup(); }
+});
+
+test('BI26091201: a freshly-bootstrapped (empty) vault refuses to back up, and says so in the public status', async () => {
+  // No VAULT_BACKUP_MIN_CONTENT_ROWS override -- the real default guard. A
+  // fixture vault has every schema table created and zero rows in all of
+  // them, which is exactly the shape of the failed-restore / fresh-checkout
+  // database PI26091001 watched overwrite good OneDrive backup history.
+  const { server, port, cleanup } = await startServer({
+    VAULT_STORE_ENGINE: 'sqlite', VAULT_DB_KEY_PASSPHRASE: 'test-fixture-passphrase',
+  });
+  try {
+    const runRes = await fetch(`http://127.0.0.1:${port}/backup/run`, {
+      method: 'POST', headers: { Authorization: 'Bearer test-static-token' },
+    });
+    const runBody = await runRes.json();
+    assert.equal(runBody.skipped, 'empty database');
+    assert.equal(runBody.totalRows, 0);
+
+    const res = await fetch(`http://127.0.0.1:${port}/backup/status/public`);
+    const body = await res.json();
+    assert.equal(body.skipped, 'empty database');
+    assert.equal(body.ok, false, 'a skip is not a successful backup');
   } finally { server.close(); cleanup(); }
 });
 
