@@ -71,7 +71,7 @@ test('rewrite replacing rows honors the massacre guard: refuses a >50%-of-popula
   store.append('scope/tasks.tsv', { ID: '2', TITLE: 'B', STATUS: 'open' });
   store.append('scope/tasks.tsv', { ID: '3', TITLE: 'C', STATUS: 'open' });
   const lost = store.rewrite('scope/tasks.tsv', () => []); // would drop all 3, >50%
-  assert.equal(lost, 0, 'refused massacre reports 0 removed');
+  assert.equal(lost, null, 'refused massacre reports null, not a numeric 0 a caller could mistake for a normal no-op');
   assert.equal(store.read('scope/tasks.tsv').length, 3, 'rows survive the refused rewrite');
 });
 
@@ -99,12 +99,24 @@ test('rewrite from empty to populated never trips the massacre guard', () => {
   assert.equal(store.read('scope/tasks.tsv').length, 2);
 });
 
-test('rewrite on a collection whose table was never bootstrapped is a no-op, fn never called', () => {
+// FI26091501: this used to be a no-op (fn never called, table never
+// created) -- the exact bug that let learning/groups.tsv edits silently
+// fail to persist on a live host whose table predated that schema entry.
+// rewrite() now self-heals like append() already did.
+test('rewrite on a collection whose table was never bootstrapped creates it and calls fn', () => {
   const { store } = tmpStore();
   let called = false;
   const lost = store.rewrite('scope/tasks.tsv', (rows) => { called = true; return rows; });
+  assert.equal(called, true);
   assert.equal(lost, 0);
-  assert.equal(called, false);
+  assert.deepEqual(store.read('scope/tasks.tsv'), []);
+});
+
+test('rewrite on a never-bootstrapped collection can seed real rows, matching the empty-table seed pattern', () => {
+  const { store } = tmpStore();
+  const lost = store.rewrite('scope/tasks.tsv', () => [{ ID: '1', TITLE: 'seeded', STATUS: 'open' }]);
+  assert.equal(lost, -1);
+  assert.equal(store.read('scope/tasks.tsv').length, 1);
 });
 
 test('rewrite under half loss (no force needed) applies normally and reports the loss', () => {

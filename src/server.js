@@ -562,7 +562,17 @@ async function main() {
         // while this route still answered {ok:true, removed:0}, making a
         // refused write indistinguishable from a successful no-op one.
         // Found live 20 Aug purging test rows via this exact route.
+        // FI26091501: store.rewrite() now returns null for exactly that
+        // refusal, instead of the same `0` a normal no-op write returns --
+        // surface it as a real error here rather than the blanket
+        // {ok:true} every other outcome got.
         const removed = store.rewrite(collection, () => rows, { force: !!body.force, why: 'PUT /vault/:collection' });
+        if (removed === null) {
+          return sendJson(res, 409, {
+            ok: false, collection,
+            error: 'refused: would remove more than half the rows or empty a populated collection; pass {"force":true} to override',
+          });
+        }
         return sendJson(res, 200, { ok: true, collection, count: rows.length, removed });
       }
     }
