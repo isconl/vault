@@ -4,7 +4,11 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { runContentDiffSync } = require('../lib/content-diff-sync');
+const { runContentDiffSync, CONTENT_TSVS } = require('../lib/content-diff-sync');
+
+test('FL26091207: campus.tsv is a hand-authored file syncable through CONTENT_TSVS, not silently excluded', () => {
+  assert.ok(CONTENT_TSVS.some(c => c.relPath === 'learning/campus.tsv' && c.key === 'ID'));
+});
 
 function tmpMemoryDir() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'content-diff-sync-'));
