@@ -100,23 +100,66 @@ async function main() {
   const stem = gen.ref.replace(/\.db$/, '');
   const folderRes = await onedriveBrowse.listFolder(graph, BACKUP_FOLDER);
   const manifestItem = folderRes.ok && folderRes.items.find((i) => i.name === `${stem}.manifest.json`);
-  let saltHex = null;
-  if (manifestItem) {
-    const preview = await onedriveBrowse.getItemPreview(graph, manifestItem.id);
-    if (preview.ok && preview.isText) {
-      try { saltHex = JSON.parse(preview.textContent).saltHex || null; } catch { /* leave null */ }
+  async function saltFrom(item) {
+    if (!item) return null;
+    const preview = await onedriveBrowse.getItemPreview(graph, item.id);
+    if (!preview.ok || !preview.isText) return null;
+    try { return JSON.parse(preview.textContent).saltHex || null; } catch { return null; }
+  }
+
+  let saltHex = await saltFrom(manifestItem);
+  let saltSource = manifestItem ? `${stem}.manifest.json` : null;
+
+  // FI26091604: a generation whose own manifest predates BI26083007 is NOT
+  // necessarily unrecoverable, and treating it as such was this script's real
+  // defect -- worse than a missing feature, because it tells an operator during
+  // a disaster that their oldest backup is gone when it is sitting right there.
+  //
+  // The salt is not per-generation. sqlite-store.js creates `.db-salt` once per
+  // memoryDir and reuses it for the life of that vault, so every generation
+  // pushed by the same machine shares one salt. Backups have a single writer by
+  // design (BI26091201: only the designated pusher has them enabled), so a salt
+  // published by ANY other manifest is overwhelmingly likely to be the same one.
+  //
+  // Confirmed live on 16 Sep 2026: vault-20260831T221721Z.db carries no saltHex
+  // and had been recorded as permanently unopenable. The salt from the 6 Sep
+  // manifest opens it immediately -- 43 tables, real content. It was never dead.
+  //
+  // So: fall back, and say plainly that it is a fallback rather than a fact.
+  if (!saltHex) {
+    console.log('NOTE: this generation\'s own manifest carries no saltHex (it predates BI26083007).');
+    console.log('      Looking for a salt published by another generation -- the salt is per-VAULT,');
+    console.log('      not per-generation, so a sibling manifest very likely carries the right one.');
+    const siblings = folderRes.ok
+      ? folderRes.items.filter((i) => /\.manifest\.json$/.test(i.name) && i.name !== `${stem}.manifest.json`)
+      : [];
+    const distinct = new Map();
+    for (const s of siblings) {
+      const hex = await saltFrom(s);
+      if (hex && !distinct.has(hex)) distinct.set(hex, s.name);
+    }
+    if (distinct.size === 1) {
+      const [hex, from] = [...distinct.entries()][0];
+      saltHex = hex;
+      saltSource = `${from} (FALLBACK -- every generation in this folder publishes this same salt)`;
+    } else if (distinct.size > 1) {
+      console.log(`WARNING: ${distinct.size} different salts are published in this folder, so the`);
+      console.log('         history has had more than one writer or the vault was re-created. Try');
+      console.log('         each in turn; the right one opens the DB, the wrong ones give SQLITE_NOTADB:');
+      for (const [, from] of distinct) console.log(`           - the salt in ${from}`);
     }
   }
+
   if (saltHex) {
     const saltOutPath = path.join(path.dirname(dest), '.db-salt.restored');
     fs.writeFileSync(saltOutPath, Buffer.from(saltHex, 'hex'));
-    console.log(`OK: wrote matching salt to ${saltOutPath} (from manifest saltHex)`);
+    console.log(`OK: wrote matching salt to ${saltOutPath} (from ${saltSource})`);
     console.log('Move BOTH this file (-> .db-salt) and the restored DB into memory/ together --');
     console.log('the DB alone will fail to decrypt (SQLITE_NOTADB) without its matching salt.');
   } else {
-    console.log('WARNING: manifest has no saltHex -- this generation predates BI26083007, or the');
-    console.log('manifest could not be read. The restored DB will NOT decrypt without the salt');
-    console.log('that was in place on the machine that pushed it.');
+    console.log('WARNING: no saltHex could be found, in this generation\'s manifest or any other.');
+    console.log('The restored DB will NOT decrypt without the salt that was in place on the machine');
+    console.log('that pushed it -- look for a `.db-salt` file in that machine\'s vault memory dir.');
   }
 }
 
