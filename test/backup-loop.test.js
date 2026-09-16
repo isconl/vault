@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { createBackupLoop } = require('../lib/backup-loop');
+const { createBackupLoop, DEFAULT_MIN_CONTENT_ROWS } = require('../lib/backup-loop');
 
 function fakeStore({ memoryDir, snapshotError = null } = {}) {
   const dir = memoryDir || fs.mkdtempSync(path.join(os.tmpdir(), 'backup-loop-store-'));
@@ -156,6 +156,95 @@ test('getLastResult reflects the most recent completed pass', async () => {
   assert.deepEqual(loop.getLastResult(), result);
 });
 
+// -- BI26091201: emptiness guard ------------------------------------------
+// A store that reports its content row counts, the way the real sqlite store
+// does. The fakes above deliberately DON'T have contentStats -- that's the
+// tsv-engine/legacy shape, and every test above doubles as proof the guard
+// stays out of the way when a store can't answer the question.
+function countingStore(totalRows, opts = {}) {
+  const store = fakeStore(opts);
+  store.contentStats = () => ({
+    totalRows,
+    counts: { 'learning/courses.tsv': totalRows, raw_blobs: 0 },
+  });
+  return store;
+}
+
+test('runOnce refuses to push a database with no real content in it, and says why', async () => {
+  const store = countingStore(0);
+  const backupTarget = fakeBackupTarget();
+  const loop = createBackupLoop({ store, backupTarget });
+
+  const result = await loop.runOnce();
+
+  assert.equal(result.skipped, 'empty database');
+  assert.equal(result.totalRows, 0);
+  assert.equal(result.minContentRows, DEFAULT_MIN_CONTENT_ROWS);
+  assert.equal(store.snapshotCalls.length, 0, 'must not even snapshot an empty DB');
+  assert.equal(backupTarget.pushCalls.length, 0, 'an empty DB must never reach the shared backup history');
+  assert.equal(backupTarget.pruneCalls.length, 0, 'and must never trigger retention against good generations');
+});
+
+test('a near-empty database is skipped too -- the guard is a threshold, not a zero-check', async () => {
+  const store = countingStore(DEFAULT_MIN_CONTENT_ROWS - 1);
+  const backupTarget = fakeBackupTarget();
+  const loop = createBackupLoop({ store, backupTarget });
+
+  const result = await loop.runOnce();
+
+  assert.equal(result.skipped, 'empty database');
+  assert.equal(backupTarget.pushCalls.length, 0);
+});
+
+test('a database at or above the threshold pushes normally', async () => {
+  const store = countingStore(DEFAULT_MIN_CONTENT_ROWS);
+  const backupTarget = fakeBackupTarget();
+  const loop = createBackupLoop({ store, backupTarget });
+
+  const result = await loop.runOnce();
+
+  assert.equal(result.ok, true);
+  assert.equal(backupTarget.pushCalls.length, 1);
+});
+
+test('the threshold is configurable per loop', async () => {
+  const store = countingStore(5);
+  const backupTarget = fakeBackupTarget();
+  const loop = createBackupLoop({ store, backupTarget, minContentRows: 3 });
+
+  const result = await loop.runOnce();
+
+  assert.equal(result.ok, true, '5 rows clears a threshold of 3');
+});
+
+test('an empty-DB skip is reported through getLastResult and audit-logged, not silently swallowed', async () => {
+  const store = countingStore(0);
+  const backupTarget = fakeBackupTarget();
+  const logged = [];
+  const loop = createBackupLoop({
+    store, backupTarget, auditLog: { log: (event, data) => logged.push({ event, data }) },
+  });
+
+  const result = await loop.runOnce();
+
+  assert.deepEqual(loop.getLastResult(), result);
+  assert.equal(logged.length, 1);
+  assert.equal(logged[0].event, 'vault_backup_skipped_empty');
+  assert.equal(logged[0].data.totalRows, 0);
+});
+
+test('a store whose contentStats throws still backs up -- the guard must never break backups itself', async () => {
+  const store = fakeStore();
+  store.contentStats = () => { throw new Error('table missing'); };
+  const backupTarget = fakeBackupTarget();
+  const loop = createBackupLoop({ store, backupTarget });
+
+  const result = await loop.runOnce();
+
+  assert.equal(result.ok, true);
+  assert.equal(backupTarget.pushCalls.length, 1);
+});
+
 test('never pulls anything -- this loop is one-directional, local-to-remote only (no fetch/pull calls exist on the interface it uses)', async () => {
   const store = fakeStore();
   const backupTarget = fakeBackupTarget();
@@ -164,4 +253,79 @@ test('never pulls anything -- this loop is one-directional, local-to-remote only
   const loop = createBackupLoop({ store, backupTarget });
   await loop.runOnce();
   assert.equal('fetch' in backupTarget, false);
+});
+
+// --- FI26091604: an unrestorable snapshot must never be published ------------
+
+function verifyingStore({ verdict, memoryDir } = {}) {
+  const s = fakeStore({ memoryDir });
+  s.verifyCalls = [];
+  s.verifySnapshot = (filePath, saltHex) => {
+    s.verifyCalls.push({ filePath, saltHex });
+    return verdict;
+  };
+  return s;
+}
+
+test('FI26091604: a snapshot that cannot be restored is NOT pushed, and the pass reports failure', async () => {
+  const store = verifyingStore({ verdict: { ok: false, error: 'SQLITE_NOTADB' } });
+  const target = fakeBackupTarget();
+  const logs = [];
+  const loop = createBackupLoop({ store, backupTarget: target, auditLog: { log: (e, d) => logs.push({ e, d }) } });
+
+  const result = await loop.runOnce();
+
+  assert.equal(result.ok, false);
+  assert.equal(result.stage, 'verify');
+  assert.match(result.error, /unrestorable/);
+  assert.equal(target.pushCalls.length, 0, 'nothing may be published');
+  assert.equal(target.pruneCalls.length, 0, 'and retention must not run -- a failed pass must not evict a good generation');
+  assert.ok(logs.some((l) => l.e === 'vault_backup_unrestorable'));
+});
+
+test('FI26091604: the 31 Aug 2026 shape -- an encrypted store with no readable salt is refused rather than shipped', async () => {
+  // The real generation was published with no saltHex and reported ok for two
+  // weeks. Here the store can verify (so it is the sqlite engine) and there is
+  // no .db-salt file to read, which is exactly that situation.
+  const store = verifyingStore({ verdict: { ok: false, error: 'no salt supplied -- the snapshot could never be decrypted' } });
+  const target = fakeBackupTarget();
+  const logs = [];
+  const loop = createBackupLoop({ store, backupTarget: target, auditLog: { log: (e, d) => logs.push({ e, d }) } });
+
+  const result = await loop.runOnce();
+
+  assert.equal(result.ok, false);
+  assert.equal(target.pushCalls.length, 0);
+  assert.equal(store.verifyCalls[0].saltHex, undefined, 'it was asked to verify with the salt it actually had: none');
+  const audit = logs.find((l) => l.e === 'vault_backup_unrestorable');
+  assert.equal(audit.d.hadSalt, false);
+});
+
+test('FI26091604: a verified snapshot is pushed as normal and records what was proven', async () => {
+  const memoryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'backup-loop-verify-'));
+  fs.writeFileSync(path.join(memoryDir, '.db-salt'), Buffer.from('abcd', 'hex'));
+  const store = verifyingStore({ verdict: { ok: true, tables: 47 }, memoryDir });
+  const target = fakeBackupTarget();
+  const logs = [];
+  const loop = createBackupLoop({ store, backupTarget: target, auditLog: { log: (e, d) => logs.push({ e, d }) } });
+
+  const result = await loop.runOnce();
+
+  assert.equal(result.ok, true);
+  assert.equal(result.verified, 47, 'the result distinguishes a proven-restorable pass from one that merely uploaded');
+  assert.equal(target.pushCalls.length, 1);
+  assert.equal(store.verifyCalls[0].saltHex, 'abcd', 'verified against the same salt the manifest carries');
+  assert.ok(logs.some((l) => l.e === 'vault_backup_verified'));
+});
+
+test('FI26091604: a store that cannot verify (the tsv engine) still backs up -- the check must not break engines without encryption', async () => {
+  const store = fakeStore(); // no verifySnapshot
+  const target = fakeBackupTarget();
+  const loop = createBackupLoop({ store, backupTarget: target });
+
+  const result = await loop.runOnce();
+
+  assert.equal(result.ok, true);
+  assert.equal(target.pushCalls.length, 1);
+  assert.equal(result.verified, null, 'and it says plainly that nothing was proven, rather than implying it was');
 });

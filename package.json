@@ -15,5 +15,8 @@
     "@bitwarden/sdk-napi": "^1.0.0",
     "better-sqlite3-multiple-ciphers": "^13.0.3"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "allowScripts": {
+    "better-sqlite3-multiple-ciphers@13.0.3": true
+  }
 }

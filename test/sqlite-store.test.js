@@ -328,3 +328,54 @@ test('table name mapping: schema key with / and .tsv stripped, e.g. scope/tasks.
   const tables = raw.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((r) => r.name).sort();
   assert.deepEqual(tables, ['circle__people', 'raw_blobs', 'scope__tasks']);
 });
+
+// --- FI26091604: snapshot restorability -------------------------------------
+
+test('verifySnapshot opens a snapshot with the salt that will actually be published', () => {
+  const { store, memoryDir } = tmpStore();
+  store.ensureVault();
+  store.append('scope/tasks.tsv', { ID: 'T1', TITLE: 'real content', STATUS: 'next' });
+
+  const snap = path.join(memoryDir, 'snap.db');
+  store.snapshotToFile(snap);
+  const saltHex = fs.readFileSync(path.join(memoryDir, '.db-salt')).toString('hex');
+
+  const verdict = store.verifySnapshot(snap, saltHex);
+  assert.equal(verdict.ok, true);
+  assert.ok(verdict.tables > 0, 'a real snapshot reports the tables it carries');
+});
+
+test('verifySnapshot refuses when no salt is supplied -- the 31 Aug 2026 generation shape', () => {
+  const { store, memoryDir } = tmpStore();
+  store.ensureVault();
+  const snap = path.join(memoryDir, 'snap.db');
+  store.snapshotToFile(snap);
+
+  // A snapshot with no salt is not a backup: the key is scrypt(passphrase, salt),
+  // so without the salt it can never be opened again by anyone, ever.
+  const verdict = store.verifySnapshot(snap, undefined);
+  assert.equal(verdict.ok, false);
+  assert.match(verdict.error, /no salt/i);
+});
+
+test('verifySnapshot refuses a snapshot whose salt does not match the one it was encrypted with', () => {
+  const { store, memoryDir } = tmpStore();
+  store.ensureVault();
+  const snap = path.join(memoryDir, 'snap.db');
+  store.snapshotToFile(snap);
+
+  const wrongSalt = Buffer.from('00'.repeat(16), 'hex').toString('hex');
+  const verdict = store.verifySnapshot(snap, wrongSalt);
+  assert.equal(verdict.ok, false, 'a wrong salt derives a wrong key and must not pass');
+});
+
+test('verifySnapshot never leaks the passphrase or derived key through its error string', () => {
+  const { store, memoryDir } = tmpStore();
+  store.ensureVault();
+  const snap = path.join(memoryDir, 'snap.db');
+  store.snapshotToFile(snap);
+
+  const verdict = store.verifySnapshot(snap, Buffer.from('11'.repeat(16), 'hex').toString('hex'));
+  assert.equal(verdict.ok, false);
+  assert.ok(!verdict.error.includes(PASSPHRASE), 'the passphrase must never appear in an error');
+});

@@ -105,7 +105,15 @@ test('GET /backup/status/public reports completion and result shape after a back
   // creds in this test env, so the push itself fails (502-shaped), but
   // that's still a real completed pass with a real result to report;
   // proves /backup/run and /backup/status/public share state either way.
-  const { server, port, cleanup } = await startServer({ VAULT_STORE_ENGINE: 'sqlite', VAULT_DB_KEY_PASSPHRASE: 'test-fixture-passphrase' });
+  // VAULT_BACKUP_MIN_CONTENT_ROWS=0 (BI26091201): this fixture vault is
+  // freshly bootstrapped and therefore empty, which the emptiness guard would
+  // otherwise -- correctly -- refuse to back up. This test is about the
+  // status endpoint sharing state with /backup/run, so the guard is turned
+  // off here; the test below covers the guard's own behaviour end to end.
+  const { server, port, cleanup } = await startServer({
+    VAULT_STORE_ENGINE: 'sqlite', VAULT_DB_KEY_PASSPHRASE: 'test-fixture-passphrase',
+    VAULT_BACKUP_MIN_CONTENT_ROWS: '0',
+  });
   try {
     await fetch(`http://127.0.0.1:${port}/backup/run`, {
       method: 'POST', headers: { Authorization: 'Bearer test-static-token' },
@@ -115,6 +123,30 @@ test('GET /backup/status/public reports completion and result shape after a back
     assert.equal(body.firstPassComplete, true);
     assert.equal(typeof body.ok, 'boolean');
     assert.ok(body.finishedAt);
+    assert.equal(body.skipped, null, 'a real pass ran -- nothing was skipped');
+  } finally { server.close(); cleanup(); }
+});
+
+test('BI26091201: a freshly-bootstrapped (empty) vault refuses to back up, and says so in the public status', async () => {
+  // No VAULT_BACKUP_MIN_CONTENT_ROWS override -- the real default guard. A
+  // fixture vault has every schema table created and zero rows in all of
+  // them, which is exactly the shape of the failed-restore / fresh-checkout
+  // database PI26091001 watched overwrite good OneDrive backup history.
+  const { server, port, cleanup } = await startServer({
+    VAULT_STORE_ENGINE: 'sqlite', VAULT_DB_KEY_PASSPHRASE: 'test-fixture-passphrase',
+  });
+  try {
+    const runRes = await fetch(`http://127.0.0.1:${port}/backup/run`, {
+      method: 'POST', headers: { Authorization: 'Bearer test-static-token' },
+    });
+    const runBody = await runRes.json();
+    assert.equal(runBody.skipped, 'empty database');
+    assert.equal(runBody.totalRows, 0);
+
+    const res = await fetch(`http://127.0.0.1:${port}/backup/status/public`);
+    const body = await res.json();
+    assert.equal(body.skipped, 'empty database');
+    assert.equal(body.ok, false, 'a skip is not a successful backup');
   } finally { server.close(); cleanup(); }
 });
 
@@ -192,6 +224,71 @@ test('PUT /vault/:collection replaces the whole row set -- the read-modify-write
     const readBody = await read.json();
     assert.equal(readBody.rows.length, 1);
     assert.equal(readBody.rows[0].ID, 'T1');
+  } finally { server.close(); cleanup(); }
+});
+
+test('GET /cycle-theme returns theme:null when no override has been written for that cycle', async () => {
+  const { server, port, cleanup } = await startServer();
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/cycle-theme?cycleKey=2026-4`, {
+      headers: { Authorization: 'Bearer test-static-token' },
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.cycleKey, '2026-4');
+    assert.equal(body.theme, null);
+  } finally { server.close(); cleanup(); }
+});
+
+test('GET /cycle-theme requires cycleKey', async () => {
+  const { server, port, cleanup } = await startServer();
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/cycle-theme`, {
+      headers: { Authorization: 'Bearer test-static-token' },
+    });
+    assert.equal(res.status, 400);
+  } finally { server.close(); cleanup(); }
+});
+
+test('POST /cycle-theme sets an override, then GET returns it -- and an empty theme clears it back to null', async () => {
+  const { server, port, cleanup } = await startServer();
+  try {
+    const set = await fetch(`http://127.0.0.1:${port}/cycle-theme`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer test-static-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cycleKey: '2026-4', theme: 'Leverage' }),
+    });
+    assert.equal(set.status, 200);
+    const setBody = await set.json();
+    assert.equal(setBody.ok, true);
+    assert.equal(setBody.theme, 'Leverage');
+
+    const read = await fetch(`http://127.0.0.1:${port}/cycle-theme?cycleKey=2026-4`, {
+      headers: { Authorization: 'Bearer test-static-token' },
+    });
+    const readBody = await read.json();
+    assert.equal(readBody.theme, 'Leverage');
+
+    // A second cycle's key stays untouched by the first override.
+    const other = await fetch(`http://127.0.0.1:${port}/cycle-theme?cycleKey=2026-5`, {
+      headers: { Authorization: 'Bearer test-static-token' },
+    });
+    const otherBody = await other.json();
+    assert.equal(otherBody.theme, null);
+
+    const clear = await fetch(`http://127.0.0.1:${port}/cycle-theme`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer test-static-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cycleKey: '2026-4', theme: '' }),
+    });
+    const clearBody = await clear.json();
+    assert.equal(clearBody.theme, null);
+
+    const readAfterClear = await fetch(`http://127.0.0.1:${port}/cycle-theme?cycleKey=2026-4`, {
+      headers: { Authorization: 'Bearer test-static-token' },
+    });
+    const readAfterClearBody = await readAfterClear.json();
+    assert.equal(readAfterClearBody.theme, null);
   } finally { server.close(); cleanup(); }
 });
 

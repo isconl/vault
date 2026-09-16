@@ -37,6 +37,7 @@ const { createContentSyncLoop } = require('../lib/content-sync-loop');
 const { createOneDriveBackupTarget } = require('../lib/backup/onedrive-target');
 const corporateDiscovery = require('../lib/corporate-discovery');
 const venturesDiscovery = require('../lib/ventures-discovery');
+const { createLibrarySync } = require('../lib/library-sync');
 const manifest = require('../lib/manifest');
 
 const PORT = parseInt(process.env.VAULT_PORT || process.env.PORT || '8081', 10);
@@ -109,6 +110,19 @@ async function main() {
   console.log(`  vault: ${repairResult.created.length} file(s) bootstrapped, ` +
     `${repairResult.columnsUpgraded} column migration(s)` +
     (VAULT_STORE_ENGINE === 'sqlite' ? ' (sqlite engine)' : ''));
+
+  // BL26082601: iSpark Library selection + sync -- LIBRARY_MEMORY_DIR unset
+  // is a normal, expected state on the main fleet's own vault (this
+  // capability only matters on a tenant instance); librarySync.listCatalog()
+  // degrades to ok:false rather than throwing when it's unset.
+  const librarySync = createLibrarySync({
+    libraryMemoryDir: process.env.LIBRARY_MEMORY_DIR || '',
+    tenantMemoryDir: MEMORY_DIR,
+    readTSV: store.read,
+    appendTSV: store.append,
+    rewriteTSV: store.rewrite,
+    auditLog,
+  });
 
   // Corpus health check (FI26082602, 26 Aug 2026): history/onthisday.tsv is
   // deliberately excluded from the auto-pull sync loop (sync-loop.js's
@@ -216,27 +230,52 @@ async function main() {
 
   // -- 5.5. Backup loop (encrypted whole-DB snapshot -> OneDrive, on an
   // interval; local-to-remote only, one-directional, no pull ever) --------
-  // Off by default for the same reason the old sync loop was: the test
-  // suite calls main() repeatedly with no real Graph credentials
-  // configured, and an enabled-by-default loop would fire real HTTPS calls
-  // per test. Falls back to a Bitwarden secret (not just the env var), same
-  // as the old VAULT_SYNC_INTERVAL_MS did, so this survives a fresh clone
-  // on any deploy path. Default 30 minutes (1800000ms) when explicitly
-  // enabled with no value -- a deliberate, visible choice distinct from the
-  // old pull loop's 900s tuning (that number was about pull freshness; this
-  // one is about acceptable backup recovery-point-objective), not silently
-  // inherited. Only meaningful on the sqlite engine (needs
+  // OFF unless explicitly enabled (BI26091201, 12 Sep 2026, per Sconl --
+  // this fallback used to be 30 minutes, i.e. backups ON for anyone who
+  // didn't know to turn them off). Every machine running vault shares ONE
+  // OneDrive backup history, so "on by default" meant every dev checkout
+  // silently pushed generations into the same history the OCI VM's disaster
+  // recovery depends on -- PI26091001/OI26091001: a fresh Windows checkout
+  // put three near-empty ~196KB generations in among another machine's real
+  // ~24MB ones, cleaned up by hand. Opting in is now a deliberate act, made
+  // once, on the one machine that should be the designated pusher: the VM
+  // sets VAULT_BACKUP_INTERVAL_MS=1800000 explicitly in
+  // deploy/docker-compose.vm.yml, so live behaviour is unchanged. The
+  // launchers' own VAULT_BACKUP_INTERVAL_MS=0 defaults (FI26091203) become
+  // belt-and-braces rather than the only thing standing between a dev
+  // machine and the shared history.
+  //
+  // Still falls back to a Bitwarden secret (not just the env var), same as
+  // the old VAULT_SYNC_INTERVAL_MS did, so an enabled deploy survives a
+  // fresh clone on any deploy path. 1800000 (30 minutes) is the intended
+  // value where it IS enabled -- a deliberate choice about acceptable
+  // backup recovery-point-objective, distinct from the old pull loop's 900s
+  // freshness tuning. Only meaningful on the sqlite engine (needs
   // store.snapshotToFile) -- skipped with a clear log line on 'tsv'.
-  const VAULT_BACKUP_INTERVAL_MS = parseInt(process.env.VAULT_BACKUP_INTERVAL_MS || secretStore.get('VAULT_BACKUP_INTERVAL_MS') || String(30 * 60 * 1000), 10);
+  const VAULT_BACKUP_INTERVAL_MS = parseInt(process.env.VAULT_BACKUP_INTERVAL_MS || secretStore.get('VAULT_BACKUP_INTERVAL_MS') || '0', 10);
   const backupTarget = createOneDriveBackupTarget({ graph });
-  const backupLoop = createBackupLoop({ store, backupTarget, auditLog });
+  // BI26091201: the emptiness guard's threshold (rows across the key content
+  // collections, see sqlite-store.js contentStats()). Overridable, but only
+  // deliberately: the only real reason to lower it is a genuinely tiny vault
+  // that should still be backed up, and the only reason to raise it is a
+  // machine whose "restored" bar is higher than "not literally empty".
+  const backupMinRows = process.env.VAULT_BACKUP_MIN_CONTENT_ROWS;
+  const backupLoop = createBackupLoop({
+    store, backupTarget, auditLog,
+    ...(backupMinRows !== undefined && backupMinRows !== '' ? { minContentRows: parseInt(backupMinRows, 10) } : {}),
+  });
   if (VAULT_STORE_ENGINE !== 'sqlite') {
     console.log(`  vault backup: disabled (VAULT_STORE_ENGINE=${VAULT_STORE_ENGINE}, backups need the sqlite engine)`);
   } else if (VAULT_BACKUP_INTERVAL_MS > 0) {
     backupLoop.start(VAULT_BACKUP_INTERVAL_MS);
-    console.log(`  vault backup: enabled, every ${Math.round(VAULT_BACKUP_INTERVAL_MS / 1000)}s`);
+    // BI26091201: say this out loud on the enabled path too, so "this machine
+    // is the one pushing into the shared OneDrive history" is visible in ops
+    // logs rather than inferred from the absence of the disabled line below.
+    console.log(`  vault backup: ENABLED, every ${Math.round(VAULT_BACKUP_INTERVAL_MS / 1000)}s -- this machine pushes generations into the shared OneDrive backup history`);
   } else {
-    console.log('  vault backup: disabled (set VAULT_BACKUP_INTERVAL_MS to enable)');
+    // BI26091201: backups are opt-in now, so this is the NORMAL path on every
+    // dev machine -- worded so it doesn't read like a misconfiguration.
+    console.log('  vault backup: off (opt-in; set VAULT_BACKUP_INTERVAL_MS=1800000 to make this machine push into the shared OneDrive backup history)');
   }
 
   // -- 5.6. Content sync loop (file-based course/content authoring ->
@@ -376,6 +415,18 @@ async function main() {
         running: backupLoop.isRunning(),
         firstPassComplete: !!r,
         ok: r ? !!r.ok : false,
+        // BI26091201: a pass can now end in a deliberate skip ('empty
+        // database') rather than a success or a failure. Surface it here, or
+        // a machine skipping every single pass looks identical to one that
+        // has simply never succeeded -- and the whole point of the guard is
+        // that it's a visible, explainable refusal.
+        skipped: r && r.skipped ? r.skipped : null,
+        // FI26091604: "it uploaded" and "it can be restored" are different
+        // claims, and conflating them is how a 15MB unopenable file sat in the
+        // retention window for two weeks reporting ok. null means nothing was
+        // proven (an engine without encryption), a number means the snapshot
+        // was opened with the salt actually published alongside it.
+        verified: r && r.verified !== undefined ? r.verified : null,
         error: r ? r.error : null,
         startedAt: r ? r.startedAt : null,
         finishedAt: r ? r.finishedAt : null,
@@ -643,6 +694,22 @@ async function main() {
     // generic /vault-raw/ wrapper so a client gets parsed JSON directly
     // instead of a {collection,text} envelope. Deliberately NOT tied to any
     // OAuth identity -- see BL26082601's tenant-isolation decision.
+    if (pathname === '/library/catalog' && req.method === 'GET') {
+      return sendJson(res, 200, librarySync.listCatalog());
+    }
+    if (pathname === '/library/selection' && req.method === 'GET') {
+      return sendJson(res, 200, { ok: true, selection: librarySync.getSelection() });
+    }
+    if (pathname === '/library/selection' && req.method === 'POST') {
+      let body = {};
+      try { body = JSON.parse(await readBody(req) || '{}'); } catch {}
+      const courseIds = Array.isArray(body.courseIds) ? body.courseIds.map(String) : [];
+      try {
+        return sendJson(res, 200, librarySync.setSelection(courseIds));
+      } catch (e) {
+        return sendJson(res, 400, { ok: false, error: String(e.message || e) });
+      }
+    }
     if (pathname === '/profile' && req.method === 'GET') {
       const text = store.rawRead('profile/settings.json');
       let profile = {};
@@ -961,6 +1028,33 @@ async function main() {
       const date = searchParams.get('date') || new Date().toISOString().slice(0, 10);
       const row = store.read('scope/theme_days.tsv').find(r => r.DATE === date);
       return sendJson(res, 200, { date, phrase: row ? row.PHRASE : null });
+    }
+
+    // BT26091001: per-cycle equicycle theme override. cycleKey is
+    // "<eqYear>-<cycleNum>" -- the client already computes both (see
+    // app.js's localDayNow()), so this route trusts it rather than
+    // re-deriving the equicycle date math server-side.
+    if (pathname === '/cycle-theme' && req.method === 'GET') {
+      const { searchParams } = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+      const cycleKey = searchParams.get('cycleKey');
+      if (!cycleKey) return sendJson(res, 400, { ok: false, error: 'cycleKey required' });
+      const row = store.read('scope/cycle_themes.tsv').find(r => r.CYCLE_KEY === cycleKey);
+      return sendJson(res, 200, { cycleKey, theme: row ? row.THEME : null });
+    }
+
+    if (pathname === '/cycle-theme' && req.method === 'POST') {
+      let body = {};
+      try { body = JSON.parse(await readBody(req) || '{}'); } catch {}
+      const cycleKey = body.cycleKey;
+      const theme = (body.theme || '').trim();
+      if (!cycleKey) return sendJson(res, 400, { ok: false, error: 'cycleKey required' });
+      store.rewrite('scope/cycle_themes.tsv', (rows) => {
+        const kept = rows.filter(r => r.CYCLE_KEY !== cycleKey);
+        if (theme) kept.push({ CYCLE_KEY: cycleKey, THEME: theme, ADDED_AT: new Date().toISOString() });
+        return kept;
+      }, { why: 'POST /cycle-theme' });
+      auditLog.log('cycle_theme_set', { cycleKey, theme: theme || null });
+      return sendJson(res, 200, { ok: true, cycleKey, theme: theme || null });
     }
 
     if (pathname === '/onthisday' && req.method === 'GET') {
