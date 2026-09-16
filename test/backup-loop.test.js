@@ -254,3 +254,78 @@ test('never pulls anything -- this loop is one-directional, local-to-remote only
   await loop.runOnce();
   assert.equal('fetch' in backupTarget, false);
 });
+
+// --- FI26091604: an unrestorable snapshot must never be published ------------
+
+function verifyingStore({ verdict, memoryDir } = {}) {
+  const s = fakeStore({ memoryDir });
+  s.verifyCalls = [];
+  s.verifySnapshot = (filePath, saltHex) => {
+    s.verifyCalls.push({ filePath, saltHex });
+    return verdict;
+  };
+  return s;
+}
+
+test('FI26091604: a snapshot that cannot be restored is NOT pushed, and the pass reports failure', async () => {
+  const store = verifyingStore({ verdict: { ok: false, error: 'SQLITE_NOTADB' } });
+  const target = fakeBackupTarget();
+  const logs = [];
+  const loop = createBackupLoop({ store, backupTarget: target, auditLog: { log: (e, d) => logs.push({ e, d }) } });
+
+  const result = await loop.runOnce();
+
+  assert.equal(result.ok, false);
+  assert.equal(result.stage, 'verify');
+  assert.match(result.error, /unrestorable/);
+  assert.equal(target.pushCalls.length, 0, 'nothing may be published');
+  assert.equal(target.pruneCalls.length, 0, 'and retention must not run -- a failed pass must not evict a good generation');
+  assert.ok(logs.some((l) => l.e === 'vault_backup_unrestorable'));
+});
+
+test('FI26091604: the 31 Aug 2026 shape -- an encrypted store with no readable salt is refused rather than shipped', async () => {
+  // The real generation was published with no saltHex and reported ok for two
+  // weeks. Here the store can verify (so it is the sqlite engine) and there is
+  // no .db-salt file to read, which is exactly that situation.
+  const store = verifyingStore({ verdict: { ok: false, error: 'no salt supplied -- the snapshot could never be decrypted' } });
+  const target = fakeBackupTarget();
+  const logs = [];
+  const loop = createBackupLoop({ store, backupTarget: target, auditLog: { log: (e, d) => logs.push({ e, d }) } });
+
+  const result = await loop.runOnce();
+
+  assert.equal(result.ok, false);
+  assert.equal(target.pushCalls.length, 0);
+  assert.equal(store.verifyCalls[0].saltHex, undefined, 'it was asked to verify with the salt it actually had: none');
+  const audit = logs.find((l) => l.e === 'vault_backup_unrestorable');
+  assert.equal(audit.d.hadSalt, false);
+});
+
+test('FI26091604: a verified snapshot is pushed as normal and records what was proven', async () => {
+  const memoryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'backup-loop-verify-'));
+  fs.writeFileSync(path.join(memoryDir, '.db-salt'), Buffer.from('abcd', 'hex'));
+  const store = verifyingStore({ verdict: { ok: true, tables: 47 }, memoryDir });
+  const target = fakeBackupTarget();
+  const logs = [];
+  const loop = createBackupLoop({ store, backupTarget: target, auditLog: { log: (e, d) => logs.push({ e, d }) } });
+
+  const result = await loop.runOnce();
+
+  assert.equal(result.ok, true);
+  assert.equal(result.verified, 47, 'the result distinguishes a proven-restorable pass from one that merely uploaded');
+  assert.equal(target.pushCalls.length, 1);
+  assert.equal(store.verifyCalls[0].saltHex, 'abcd', 'verified against the same salt the manifest carries');
+  assert.ok(logs.some((l) => l.e === 'vault_backup_verified'));
+});
+
+test('FI26091604: a store that cannot verify (the tsv engine) still backs up -- the check must not break engines without encryption', async () => {
+  const store = fakeStore(); // no verifySnapshot
+  const target = fakeBackupTarget();
+  const loop = createBackupLoop({ store, backupTarget: target });
+
+  const result = await loop.runOnce();
+
+  assert.equal(result.ok, true);
+  assert.equal(target.pushCalls.length, 1);
+  assert.equal(result.verified, null, 'and it says plainly that nothing was proven, rather than implying it was');
+});

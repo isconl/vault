@@ -421,6 +421,12 @@ async function main() {
         // has simply never succeeded -- and the whole point of the guard is
         // that it's a visible, explainable refusal.
         skipped: r && r.skipped ? r.skipped : null,
+        // FI26091604: "it uploaded" and "it can be restored" are different
+        // claims, and conflating them is how a 15MB unopenable file sat in the
+        // retention window for two weeks reporting ok. null means nothing was
+        // proven (an engine without encryption), a number means the snapshot
+        // was opened with the salt actually published alongside it.
+        verified: r && r.verified !== undefined ? r.verified : null,
         error: r ? r.error : null,
         startedAt: r ? r.startedAt : null,
         finishedAt: r ? r.finishedAt : null,
