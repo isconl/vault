@@ -1,0 +1,22 @@
+{
+  "name": "@isconl/vault",
+  "version": "0.1.0",
+  "private": false,
+  "description": "isconl-agent foundation engine: auth/session, TSV vault store, Microsoft Graph client, secrets, AI-provider routing",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@bitwarden/sdk-napi": "^1.0.0",
+    "better-sqlite3-multiple-ciphers": "^13.0.3"
+  },
+  "license": "MIT",
+  "allowScripts": {
+    "better-sqlite3-multiple-ciphers@13.0.3": true
+  }
+}

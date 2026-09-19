@@ -1,0 +1,12 @@
+# .pre-commit-config.yaml template for the split-out isconl-agent repos.
+# Local, fast feedback before a secret/identity leak even reaches a commit --
+# defense in depth alongside the CI workflow (gitleaks-ci-template.yml), which
+# is the real enforcement backstop since pre-commit hooks can be skipped with
+# --no-verify. CI is what actually blocks a merge regardless of local setup.
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+
+# Setup (once per clone): pip install pre-commit && pre-commit install
